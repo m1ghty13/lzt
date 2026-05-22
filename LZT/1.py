@@ -235,14 +235,36 @@ def get_turnstile_sitekey(page, logger) -> str:
     logger.warning("[SITEKEY] Sitekey not found")
     return None
 
+def check_2captcha_balance(logger) -> float | None:
+    """Проверить баланс и валидность API-ключа. Возвращает баланс или None."""
+    try:
+        resp = requests.post(
+            "https://api.2captcha.com/getBalance",
+            json={"clientKey": CAPTCHA_API_KEY},
+            timeout=10,
+        ).json()
+        if resp.get("errorId"):
+            logger.error(f"[2captcha] Ключ невалиден: {resp.get('errorDescription')} (errorId={resp.get('errorId')})")
+            return None
+        balance = resp.get("balance", 0)
+        logger.info(f"[2captcha] Баланс: ${balance:.4f}")
+        return balance
+    except Exception as e:
+        logger.error(f"[2captcha] Не удалось проверить баланс: {e}")
+        return None
+
+
 def _submit_2captcha_task(task: dict, logger) -> str | None:
-    """Submit task to 2captcha and poll until ready. Returns taskId or None."""
-    logger.info(f"[2captcha] Отправка: type={task.get('type')} sitekey={task.get('websiteKey', '')[:20]}...")
+    """Submit task to 2captcha and poll until ready. Returns token or None."""
+    import json as _json
+    body = {"clientKey": CAPTCHA_API_KEY, "task": task}
+    logger.info(f"[2captcha] Запрос: {_json.dumps(body, ensure_ascii=False)}")
     resp = requests.post(
         "https://api.2captcha.com/createTask",
-        json={"clientKey": CAPTCHA_API_KEY, "task": task},
+        json=body,
         timeout=30,
     ).json()
+    logger.info(f"[2captcha] Ответ createTask: {resp}")
 
     if resp.get("errorId"):
         logger.warning(f"[2captcha] Submit error ({resp.get('errorId')}): {resp.get('errorDescription')}")
@@ -295,8 +317,25 @@ def solve_cloudflare_api(page_url: str, sitekey: str, logger,
         logger.warning("CAPTCHA_API_KEY не установлен")
         return None
 
+    # Проверяем баланс — сразу видим если ключ невалиден
+    balance = check_2captcha_balance(logger)
+    if balance is None:
+        return None
+    if balance < 0.001:
+        logger.error(f"[2captcha] Баланс слишком низкий: ${balance}")
+        return None
+
+    # Отправляем чистый URL (без CF-challenge токенов)
+    from urllib.parse import urlparse, urlencode, parse_qs, urlunparse
+    parsed = urlparse(page_url)
+    # Оставляем только те query-параметры которые нужны сайту, убираем CF-служебные
+    cf_params = {"__cf_chl_rt_tk", "__cf_chl_f_tk", "cf_chl_captcha_tk"}
+    qs = {k: v for k, v in parse_qs(parsed.query).items() if k not in cf_params}
+    clean_url = urlunparse(parsed._replace(query=urlencode(qs, doseq=True)))
+    logger.info(f"[2captcha] URL для решения: {clean_url}")
+
     base_task = {
-        "websiteURL": page_url,
+        "websiteURL": clean_url,
         "websiteKey": sitekey,
     }
 
