@@ -850,6 +850,124 @@ def click_contact_button(page, logger, retry_count=0):
             return click_contact_button(page, logger, retry_count + 1)
         return False
 
+# ---- State machine helpers ----
+
+def wait_for_page(page, logger, timeout=30000):
+    """Wait for page DOM to settle after navigation or form submit"""
+    try:
+        page.wait_for_load_state("domcontentloaded", timeout=timeout)
+    except Exception:
+        pass
+    time.sleep(random.uniform(0.4, 0.8) * SPEED_FACTOR)
+
+
+def get_page_state(page, logger) -> str:
+    """Detect current page state by URL and DOM.
+
+    Returns one of:
+      'captcha'        — Cloudflare challenge page
+      'username_entry' — initial recovery page (#email + #passwordRecovery)
+      'recovery_form'  — the full recovery form (#reg_email)
+      'confirmation'   — email-confirmation in URL
+      'closed'         — page / browser gone
+      'unknown'        — any other page (redirect in progress, final success, etc.)
+    """
+    try:
+        url = page.url
+    except Exception:
+        return "closed"
+
+    if is_challenge_page(page):
+        return "captcha"
+
+    if "email-confirmation" in url:
+        return "confirmation"
+
+    try:
+        if page.query_selector("#reg_email"):
+            return "recovery_form"
+        if page.query_selector("#email") and page.query_selector("#passwordRecovery"):
+            return "username_entry"
+    except Exception:
+        pass
+
+    return "unknown"
+
+
+def fill_and_submit_recovery_form(page, account_data, dates, logger):
+    """Fill and submit the account recovery form (reusable for both passes)"""
+    creation_month, creation_year, membership_month, membership_year = dates
+
+    logger.info("Заполняем форму восстановления...")
+
+    human_type(page, "#reg_email", account_data["mail_account"])
+    field_pause()
+    human_type(page, "#reg_email_conf", account_data["mail_account"])
+    field_pause()
+    human_type(page, "#password1", account_data["password1"])
+    field_pause()
+
+    if account_data["password2"]:
+        try:
+            page.click("#add-password")
+            button_delay()
+            human_type(page, "#password2", account_data["password2"])
+            random_delay()
+        except Exception:
+            logger.warning("Не удалось добавить второй пароль")
+
+    try:
+        skip_btn = page.query_selector("#recoveries_not_recognised")
+        if skip_btn:
+            skip_btn.click()
+            button_delay()
+            checkbox = page.query_selector(
+                "label.m-show-password__check-holder:nth-child(1) > input:nth-child(1)"
+            )
+            if checkbox:
+                checkbox.click()
+                button_delay()
+                logger.info("Вопросы восстановления пропущены")
+    except Exception as e:
+        logger.warning(f"Ошибка при пропуске вопросов: {e}")
+
+    think_pause()
+    human_type(page, "#email", account_data["payment_email_address"])
+    field_pause()
+    human_type(page, "#postcode", account_data["postcode"])
+    field_pause()
+
+    def fill_dropdown(sel, val):
+        page.click(sel)
+        time.sleep(random.uniform(0.3, 0.7) * SPEED_FACTOR)
+        for ch in str(val):
+            page.keyboard.type(ch)
+            time.sleep(random.uniform(0.05, 0.15) * SPEED_FACTOR)
+        time.sleep(random.uniform(0.3, 0.7) * SPEED_FACTOR)
+        page.keyboard.press("Enter")
+        field_pause()
+
+    fill_dropdown("#paymenttype", "credit")
+    fill_dropdown("#subslength", "1 month recurring")
+    fill_dropdown("#earliestsubsmonth", membership_month)
+    fill_dropdown("#earliestsubsyear", membership_year)
+
+    think_pause()
+    fill_dropdown("#creationmonth", creation_month)
+    fill_dropdown("#creationyear", creation_year)
+    fill_dropdown("#country_otherinfo", account_data["country"])
+    fill_dropdown("#state_otherinfo", account_data["state"])
+    human_type(page, "#isp", account_data["isp"])
+    field_pause()
+
+    random_scroll(page, 150)
+
+    logger.info("Отправляем форму...")
+    time.sleep(random.uniform(1, 2) * SPEED_FACTOR)
+    page.click('//*[@id="submit_button"]')
+    logger.info("Форма отправлена")
+
+
 # ---- Main function ----
 def main(file_number=1):
     logger = setup_logging(file_number)
@@ -863,17 +981,17 @@ def main(file_number=1):
         logger.info("=" * 60)
 
         account_data = read_account_file(file_number)
-        email_username = '@' in account_data['stored_username']
+        email_username = "@" in account_data["stored_username"]
 
         logger.info(f"Username: {account_data['stored_username']}")
         logger.info(f"Account type: {'Email-based' if email_username else 'Username-based'}")
 
         if email_username:
-            creation_month, creation_year, membership_month, membership_year = pick_creation_and_membership_for_email_like_username()
+            dates = pick_creation_and_membership_for_email_like_username()
         else:
-            creation_month, creation_year, membership_month, membership_year = pick_creation_and_membership_for_username_login()
+            dates = pick_creation_and_membership_for_username_login()
 
-        logger.info(f"Dates: Created {creation_month} {creation_year}, Member since {membership_month} {membership_year}")
+        logger.info(f"Dates: Created {dates[0]} {dates[1]}, Member since {dates[2]} {dates[3]}")
 
         kameleo_port = os.getenv("KAMELEO_PORT", "5050")
         client = KameleoLocalApiClient()
@@ -904,324 +1022,97 @@ def main(file_number=1):
         logger.info("Launching browser...")
         with sync_playwright() as p:
             try:
-                browser = p.chromium.connect_over_cdp(f"ws://localhost:{kameleo_port}/playwright/{profile.id}")
+                browser = p.chromium.connect_over_cdp(
+                    f"ws://localhost:{kameleo_port}/playwright/{profile.id}"
+                )
                 page = browser.contexts[0].new_page()
                 page.set_default_timeout(120000)
-
                 logger.info("Browser launched")
 
-                # ---- STEP 1: Navigate to recovery page ----
-                logger.info("")
-                logger.info("=" * 60)
-                logger.info("STEP 1: Navigate to recovery page")
-                logger.info("=" * 60)
+                page.goto(
+                    "https://secure.runescape.com/m=accountappeal/passwordrecovery",
+                    wait_until="domcontentloaded",
+                    timeout=30000,
+                )
 
-                # Setup network listener to capture real Turnstile sitekey from CDN request
-                page.goto('https://secure.runescape.com/m=accountappeal/passwordrecovery', wait_until="networkidle")
-                logger.info("Recovery page loaded")
+                # ---- State machine ----
+                # Each iteration detects the current page state and acts on it.
+                # No blind sleeps — we wait for DOM/URL events after every action.
+                form_submits = 0    # how many times recovery form was submitted
+                contact_clicked = False
+                state_hits = {}     # loop-detection counter per state
 
-                think_pause()
+                for step in range(30):
+                    state = get_page_state(page, logger)
+                    state_hits[state] = state_hits.get(state, 0) + 1
+                    logger.info(f"[Step {step + 1}] state={state}  url={page.url}")
 
-                # ---- STEP 2: Submit username ----
-                logger.info("")
-                logger.info("=" * 60)
-                logger.info("STEP 2: Submit username")
-                logger.info("=" * 60)
-                human_type(page, '#email', account_data['stored_username'])
-                field_pause()
-                page.click('#passwordRecovery')
-                logger.info("Username submitted, waiting for page to load...")
+                    if state_hits[state] > 4:
+                        logger.error(f"Залип в состоянии '{state}' — прерываем")
+                        break
 
-                # IMPORTANT: Wait for page to fully load before proceeding
-                # The next page will either have recovery form or CAPTCHA
-                try:
-                    page.wait_for_load_state('domcontentloaded', timeout=30000)
-                    logger.info("Page loaded successfully")
-                except:
-                    logger.warning("Page load timeout, continuing anyway")
+                    if state == "closed":
+                        logger.error("Браузер закрылся неожиданно")
+                        break
 
-                # Log where we are
-                current_url_after_submit = page.url
-                logger.info(f"Current URL after username submit: {current_url_after_submit}")
+                    elif state == "captcha":
+                        handle_cloudflare_turnstile(page, logger, account_data=account_data)
+                        wait_for_page(page, logger)
 
-                button_delay()
-
-                # ---- STEP 3: Handle login loop ----
-                logger.info("")
-                logger.info("=" * 60)
-                logger.info("STEP 3: Check for login loop")
-                logger.info("=" * 60)
-                if not handle_login_loop(page, account_data, logger):
-                    logger.error("Login loop recovery failed")
-                    raise Exception("Login loop recovery failed")
-
-                # ---- STEP 4: Handle CAPTCHA ----
-                logger.info("")
-                logger.info("=" * 60)
-                logger.info("STEP 4: Handle CAPTCHA")
-                logger.info("=" * 60)
-                handle_cloudflare_turnstile(page, logger, account_data=account_data)
-
-                # ---- STEP 5: Fill recovery form ----
-                logger.info("")
-                logger.info("=" * 60)
-                logger.info("STEP 5: Fill recovery form")
-                logger.info("=" * 60)
-
-                # Debug: Check what's on the page
-                logger.info(f"Current URL: {page.url}")
-                logger.info(f"Page title: {page.title()}")
-
-                # Debug: Show all elements on page
-                try:
-                    all_elements = page.query_selector_all('input, textarea, select, label, form, div[id], button, a[href]')
-                    logger.info(f"DEBUG: Found {len(all_elements)} total elements")
-
-                    # Show IDs of input fields
-                    inputs = page.query_selector_all('input')
-                    logger.info(f"Total input fields: {len(inputs)}")
-                    for inp in inputs[:10]:
-                        inp_id = inp.get_attribute('id') or 'no-id'
-                        inp_type = inp.get_attribute('type') or 'no-type'
-                        inp_placeholder = inp.get_attribute('placeholder') or 'no-placeholder'
-                        logger.info(f"  Input: id={inp_id}, type={inp_type}")
-
-                    # Show buttons
-                    buttons = page.query_selector_all('button')
-                    logger.info(f"Total buttons: {len(buttons)}")
-                    for btn in buttons[:5]:
-                        btn_id = btn.get_attribute('id') or 'no-id'
-                        btn_text = btn.text_content() or 'no-text'
-                        logger.info(f"  Button: id={btn_id}, text={btn_text[:30]}")
-
-                except Exception as e:
-                    logger.debug(f"Error debugging: {e}")
-
-                # Wait for navigation to complete after CAPTCHA
-                try:
-                    page.wait_for_load_state('domcontentloaded', timeout=15000)
-                    logger.info("Page load completed after CAPTCHA")
-                except:
-                    logger.warning("Page load timeout after CAPTCHA - continuing")
-                    time.sleep(3)
-
-                # Check if we have the recovery form
-                try:
-                    form_field = page.query_selector('#reg_email')
-                except Exception as e:
-                    logger.warning(f"Error accessing page after CAPTCHA: {e}")
-                    form_field = None
-
-                if not form_field:
-                    # Check if we're back at the initial recovery page (with just email + Recover button)
-                    try:
-                        recover_button = page.query_selector('#passwordRecovery')
-                        initial_email = page.query_selector('#email')
-                    except Exception as e:
-                        logger.warning(f"Error querying page elements: {e}")
-                        recover_button = None
-                        initial_email = None
-
-                    if recover_button and initial_email:
-                        logger.info("Back at initial recovery page - need to click Recover again")
-                        # Fill the email field and click Recover to advance
-                        human_type(page, '#email', account_data['stored_username'], click_first=False)
-                        field_pause()
-                        page.click('#passwordRecovery')
-                        logger.info("Clicked Recover - waiting for actual recovery form...")
-                        button_delay()
-                        time.sleep(3)
-
-                    # Now wait for the recovery form to appear
-                    logger.info("Waiting for recovery form fields...")
-                    form_wait_start = time.time()
-                    while (time.time() - form_wait_start) < 15:
+                    elif state == "username_entry":
+                        logger.info("Вводим username и нажимаем Recover...")
                         try:
-                            form_field = page.query_selector('#reg_email')
-                            if form_field:
-                                logger.info("Recovery form now visible!")
-                                break
-                        except Exception as e:
-                            logger.debug(f"Error checking for form: {e}")
-                            form_field = None
-                        time.sleep(0.5)
-
-                if form_field:
-                    human_type(page, '#reg_email', account_data['mail_account'])
-                    field_pause()
-                    human_type(page, '#reg_email_conf', account_data['mail_account'])
-                    field_pause()
-                    human_type(page, '#password1', account_data['password1'])
-                    field_pause()
-                    if account_data['password2']:
-                        try:
-                            page.click('#add-password')
-                            button_delay()
-                            human_type(page, '#password2', account_data['password2'])
-                            random_delay()
-                        except:
-                            logger.warning("Could not add second password")
-
-                    # Skip recovery questions
-                    try:
-                        skip_button = page.query_selector('#recoveries_not_recognised')
-                        if skip_button:
-                            skip_button.click()
-                            button_delay()
-                            checkbox = page.query_selector('label.m-show-password__check-holder:nth-child(1) > input:nth-child(1)')
-                            if checkbox:
-                                checkbox.click()
-                                button_delay()
-                                logger.info("Skipped recovery questions")
-                    except Exception as e:
-                        logger.warning(f"Error skipping recovery questions: {e}")
-
-                    think_pause()
-                    human_type(page, '#email', account_data['payment_email_address'])
-                    field_pause()
-                    human_type(page, '#postcode', account_data['postcode'])
-                    field_pause()
-
-                    def fill_dropdown(sel, val):
-                        page.click(sel)
-                        time.sleep(random.uniform(0.3, 0.7) * SPEED_FACTOR)
-                        for ch in str(val):
-                            page.keyboard.type(ch)
-                            time.sleep(random.uniform(0.05, 0.15) * SPEED_FACTOR)
-                        time.sleep(random.uniform(0.3, 0.7) * SPEED_FACTOR)
-                        page.keyboard.press("Enter")
+                            page.fill("#email", "")
+                        except Exception:
+                            pass
+                        human_type(page, "#email", account_data["stored_username"])
                         field_pause()
+                        page.click("#passwordRecovery")
+                        wait_for_page(page, logger)
 
-                    fill_dropdown('#paymenttype', 'credit')
-                    fill_dropdown('#subslength', '1 month recurring')
-                    fill_dropdown('#earliestsubsmonth', membership_month)
-                    fill_dropdown('#earliestsubsyear', membership_year)
+                    elif state == "recovery_form":
+                        if form_submits >= 2:
+                            logger.info("Форма заполнена дважды — завершение")
+                            break
+                        fill_and_submit_recovery_form(page, account_data, dates, logger)
+                        form_submits += 1
+                        wait_for_page(page, logger)
 
-                    think_pause()
-                    fill_dropdown('#creationmonth', creation_month)
-                    fill_dropdown('#creationyear', creation_year)
-                    fill_dropdown('#country_otherinfo', account_data['country'])
-                    fill_dropdown('#state_otherinfo', account_data['state'])
-                    human_type(page, '#isp', account_data['isp'])
-                    field_pause()
-
-                    random_scroll(page, 150)
-
-                    logger.info("Submitting recovery form...")
-                    # Reduced pause - 20 minute session limit!
-                    time.sleep(random.uniform(1, 2))
-                    page.click('//*[@id="submit_button"]')
-                    logger.info("Form submitted")
-                else:
-                    logger.info("Form already submitted")
-
-                # ---- STEP 6: Wait and check for contact button ----
-                logger.info("")
-                logger.info("=" * 60)
-                logger.info("STEP 6: Wait for confirmation page")
-                logger.info("=" * 60)
-
-                time.sleep(3)
-                current_url = page.url
-                logger.info(f"Current URL: {current_url}")
-
-                if "email-confirmation" in current_url:
-                    logger.info("On email-confirmation page")
-                    if click_contact_button(page, logger):
-                        logger.info("Contact button clicked successfully")
-                        logger.info("Waiting for page to update after contact button click...")
-                        time.sleep(3)
-
-                        # Check if recovery form appears again after contact button click
-                        form_field_after_contact = page.query_selector('#reg_email')
-                        if form_field_after_contact:
-                            logger.info("Recovery form appeared again after contact button - filling it")
-
-                            human_type(page, '#reg_email', account_data['mail_account'])
-                            field_pause()
-                            human_type(page, '#reg_email_conf', account_data['mail_account'])
-                            field_pause()
-                            human_type(page, '#password1', account_data['password1'])
-                            field_pause()
-                            if account_data['password2']:
-                                try:
-                                    page.click('#add-password')
-                                    button_delay()
-                                    human_type(page, '#password2', account_data['password2'])
-                                    random_delay()
-                                except:
-                                    logger.warning("Could not add second password")
-
-                            # Skip recovery questions
-                            try:
-                                skip_button = page.query_selector('#recoveries_not_recognised')
-                                if skip_button:
-                                    skip_button.click()
-                                    button_delay()
-                                    checkbox = page.query_selector('label.m-show-password__check-holder:nth-child(1) > input:nth-child(1)')
-                                    if checkbox:
-                                        checkbox.click()
-                                        button_delay()
-                                        logger.info("Skipped recovery questions")
-                            except Exception as e:
-                                logger.warning(f"Error skipping recovery questions: {e}")
-
-                            think_pause()
-                            human_type(page, '#email', account_data['payment_email_address'])
-                            field_pause()
-                            human_type(page, '#postcode', account_data['postcode'])
-                            field_pause()
-
-                            def fill_dropdown_post_contact(sel, val):
-                                page.click(sel)
-                                time.sleep(random.uniform(0.3, 0.7) * SPEED_FACTOR)
-                                for ch in str(val):
-                                    page.keyboard.type(ch)
-                                    time.sleep(random.uniform(0.05, 0.15) * SPEED_FACTOR)
-                                time.sleep(random.uniform(0.3, 0.7) * SPEED_FACTOR)
-                                page.keyboard.press("Enter")
-                                field_pause()
-
-                            fill_dropdown_post_contact('#paymenttype', 'credit')
-                            fill_dropdown_post_contact('#subslength', '1 month recurring')
-                            fill_dropdown_post_contact('#earliestsubsmonth', membership_month)
-                            fill_dropdown_post_contact('#earliestsubsyear', membership_year)
-
-                            think_pause()
-                            fill_dropdown_post_contact('#creationmonth', creation_month)
-                            fill_dropdown_post_contact('#creationyear', creation_year)
-                            fill_dropdown_post_contact('#country_otherinfo', account_data['country'])
-                            fill_dropdown_post_contact('#state_otherinfo', account_data['state'])
-                            human_type(page, '#isp', account_data['isp'])
-                            field_pause()
-
-                            random_scroll(page, 150)
-
-                            logger.info("Submitting recovery form (post-contact)...")
-                            time.sleep(random.uniform(1, 2))
-                            page.click('//*[@id="submit_button"]')
-                            logger.info("Form submitted after contact button")
+                    elif state == "confirmation":
+                        if contact_clicked:
+                            logger.info("Recovery завершён!")
+                            break
+                        if click_contact_button(page, logger):
+                            contact_clicked = True
+                            wait_for_page(page, logger)
                         else:
-                            logger.info("No recovery form found after contact button click")
-                    else:
-                        logger.info("Contact button not found or could not click")
-                else:
-                    logger.info(f"Not on email-confirmation page")
+                            logger.info("Contact button не найдена — recovery завершён!")
+                            break
 
-                # ---- Success ----
-                logger.info("")
-                logger.info("=" * 60)
-                logger.info("RECOVERY COMPLETED SUCCESSFULLY!")
-                logger.info("=" * 60)
+                    elif state == "unknown":
+                        # Redirect still loading, or final success page
+                        logger.info(f"Неизвестная страница ({page.url}) — ждём навигации...")
+                        try:
+                            old_url = page.url
+                            page.wait_for_function(
+                                f"() => window.location.href !== {repr(old_url)}",
+                                timeout=10000,
+                            )
+                            wait_for_page(page, logger)
+                        except Exception:
+                            logger.info("Навигации не было — завершение")
+                            break
 
-                time.sleep(3)
+                logger.info("=" * 60)
+                logger.info("RECOVERY COMPLETED!")
+                logger.info("=" * 60)
 
             finally:
                 if browser:
                     try:
                         browser.close()
                         logger.info("Browser closed")
-                    except:
+                    except Exception:
                         pass
 
     except FileNotFoundError as e:
@@ -1235,17 +1126,16 @@ def main(file_number=1):
         import traceback
         logger.error(traceback.format_exc())
     finally:
-        # Clean up Kameleo profile
         try:
             if profile and client:
                 logger.info("Cleaning up Kameleo profile...")
                 try:
-                    if hasattr(client.profile, 'delete_profile'):
+                    if hasattr(client.profile, "delete_profile"):
                         client.profile.delete_profile(profile.id)
                     logger.info("Profile cleaned up")
-                except:
+                except Exception:
                     logger.info("Profile cleanup skipped")
-        except:
+        except Exception:
             pass
 
 if __name__ == "__main__":
