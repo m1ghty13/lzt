@@ -1,0 +1,5 @@
+Python 3.8+ (3.10+ recommended).
+
+Kameleo desktop app (Windows/macOS) — must be running and logged in.
+
+For the Python program itself, I believe: pip install playwright kameleo-local-api-client

@@ -1,0 +1,4 @@
+playwright>=1.40.0
+kameleo-local-api-client>=4.4.0
+requests>=2.31.0
+python-dotenv>=1.0.0
