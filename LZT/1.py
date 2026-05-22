@@ -305,13 +305,15 @@ def _submit_2captcha_task(task: dict, logger) -> str | None:
 
 def solve_cloudflare_api(page_url: str, sitekey: str, logger,
                          proxy_host: str = None, proxy_port: int = None,
-                         proxy_user: str = None, proxy_pass: str = None) -> str:
+                         proxy_user: str = None, proxy_pass: str = None,
+                         pagedata: str = None) -> str:
     """Решить Cloudflare Turnstile через 2Captcha.
 
-    Стратегия:
-    1. TurnstileTask с http-прокси (если прокси переданы)
-    2. Fallback → TurnstileTask с socks5-прокси
-    3. Fallback → TurnstileTaskProxyless (без прокси)
+    Для managed challenge (Just a moment) требуется pagedata из _cf_chl_opt.chlPageData.
+    Стратегия попыток:
+    1. TurnstileTask + http-прокси
+    2. TurnstileTask + socks5-прокси
+    3. TurnstileTaskProxyless
     """
     if not CAPTCHA_API_KEY:
         logger.warning("CAPTCHA_API_KEY не установлен")
@@ -325,19 +327,24 @@ def solve_cloudflare_api(page_url: str, sitekey: str, logger,
         logger.error(f"[2captcha] Баланс слишком низкий: ${balance}")
         return None
 
-    # Отправляем чистый URL (без CF-challenge токенов)
+    # Чистый URL без CF-challenge токенов
     from urllib.parse import urlparse, urlencode, parse_qs, urlunparse
     parsed = urlparse(page_url)
-    # Оставляем только те query-параметры которые нужны сайту, убираем CF-служебные
     cf_params = {"__cf_chl_rt_tk", "__cf_chl_f_tk", "cf_chl_captcha_tk"}
     qs = {k: v for k, v in parse_qs(parsed.query).items() if k not in cf_params}
     clean_url = urlunparse(parsed._replace(query=urlencode(qs, doseq=True)))
     logger.info(f"[2captcha] URL для решения: {clean_url}")
+    if pagedata:
+        logger.info(f"[2captcha] pagedata передан ({len(pagedata)} chars)")
+    else:
+        logger.warning("[2captcha] pagedata НЕ передан — managed challenge может не решиться")
 
     base_task = {
         "websiteURL": clean_url,
         "websiteKey": sitekey,
     }
+    if pagedata:
+        base_task["pagedata"] = pagedata
 
     attempts = []
 
@@ -719,20 +726,46 @@ def handle_cloudflare_turnstile(page, logger, account_data: dict = None) -> bool
         logger.info("[CAPTCHA] Челлендж обнаружен — запускаем 2captcha...")
         diagnose_page_structure(page, logger)
 
-        # Ждём рендера UI
+        # Ждём пока Cloudflare JS загрузит _cf_chl_opt (нужен для pagedata и sitekey)
         try:
             page.wait_for_function(
-                "() => document.querySelectorAll('iframe').length > 0 || !!window._cf_chl_opt",
-                timeout=15000
+                "() => !!(window._cf_chl_opt?.chlPageData || window._cf_chl_opt?.IThaC9 "
+                "|| document.querySelectorAll('iframe').length > 0)",
+                timeout=15000,
             )
+            logger.info("[CAPTCHA] _cf_chl_opt / iframes готовы")
         except Exception:
-            logger.warning("[CAPTCHA] UI не отрендерился за 15s — продолжаем")
-        time.sleep(2)
+            logger.warning("[CAPTCHA] Ждать дальше некуда — пробуем с тем что есть")
+        time.sleep(1)
 
-        sitekey = get_turnstile_sitekey(page, logger)
+        # Извлекаем sitekey + pagedata из _cf_chl_opt одним вызовом
+        cf_params = {}
+        try:
+            cf_params = page.evaluate("""
+                () => {
+                    const o = window._cf_chl_opt || {};
+                    return {
+                        sitekey:  o.IThaC9      || null,
+                        pagedata: o.chlPageData  || null,
+                        action:   o.cType        || null,
+                        cdata:    o.cData        || null,
+                    };
+                }
+            """) or {}
+            logger.info(f"[CAPTCHA] _cf_chl_opt: sitekey={bool(cf_params.get('sitekey'))} "
+                        f"pagedata={bool(cf_params.get('pagedata'))} "
+                        f"action={cf_params.get('action')}")
+        except Exception as e:
+            logger.debug(f"[CAPTCHA] Не удалось прочитать _cf_chl_opt: {e}")
+
+        sitekey = cf_params.get("sitekey") or get_turnstile_sitekey(page, logger)
+        pagedata = cf_params.get("pagedata")
+
         if not sitekey:
             logger.warning("[CAPTCHA] Sitekey не найден — ждём ручного решения")
             return wait_manual_captcha(page, logger)
+
+        logger.info(f"[CAPTCHA] sitekey={sitekey}  pagedata={'да' if pagedata else 'нет'}")
 
         # Прокси из account_data
         proxy_host = proxy_port = proxy_user = proxy_pass = None
@@ -746,6 +779,7 @@ def handle_cloudflare_turnstile(page, logger, account_data: dict = None) -> bool
             page.url, sitekey, logger,
             proxy_host=proxy_host, proxy_port=proxy_port,
             proxy_user=proxy_user, proxy_pass=proxy_pass,
+            pagedata=pagedata,
         )
 
         if not token:
