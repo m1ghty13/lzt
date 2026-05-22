@@ -988,28 +988,50 @@ def handle_cloudflare_turnstile(page, logger, account_data: dict = None) -> bool
             pagedata=pagedata, cdata=cdata, action=action,
         )
 
-        if not token:
-            logger.warning("[CAPTCHA] 2captcha не вернул токен — ждём ручного решения")
-            return wait_manual_captcha(page, logger)
+        if token:
+            inject_turnstile_token(page, token, logger)
+            try:
+                page.wait_for_load_state("networkidle", timeout=15000)
+            except Exception:
+                pass
+            time.sleep(2)
+            if not is_challenge_page(page):
+                logger.info("[CAPTCHA] Челлендж пройден через API!")
+                return True
+            logger.warning("[CAPTCHA] Токен отклонён Cloudflare — пробуем авто-ожидание Kameleo")
 
-        inject_turnstile_token(page, token, logger)
-
-        try:
-            page.wait_for_load_state("networkidle", timeout=15000)
-        except Exception:
-            pass
-        time.sleep(2)
-
-        if not is_challenge_page(page):
-            logger.info("[CAPTCHA] Челлендж пройден!")
-            return True
-
-        logger.warning("[CAPTCHA] Страница всё ещё на челлендже после инжекта — ждём ручного")
-        return wait_manual_captcha(page, logger)
+        # Managed challenge: ждём авто-прохождения через Kameleo fingerprinting
+        return wait_kameleo_autopass(page, logger)
 
     except Exception as e:
         logger.error(f"[CAPTCHA] Ошибка: {e}")
         return False
+
+def wait_kameleo_autopass(page, logger, timeout=90) -> bool:
+    """Ждём авто-прохождения Cloudflare managed challenge через Kameleo fingerprinting.
+    Если за timeout секунд не прошло — переходим в ручной режим.
+    """
+    logger.info(f"[KAMELEO] Ждём авто-прохождения challenge ({timeout}s)...")
+    start = time.time()
+    last_log = 0
+
+    while time.time() - start < timeout:
+        try:
+            if not is_challenge_page(page):
+                logger.info("[KAMELEO] Challenge авто-пройден!")
+                return True
+        except Exception:
+            return True  # страница закрылась/сменилась — считаем успехом
+
+        elapsed = int(time.time() - start)
+        if elapsed - last_log >= 10:
+            logger.info(f"[KAMELEO] Ожидание авто-прохождения... {elapsed}s/{timeout}s")
+            last_log = elapsed
+        time.sleep(1)
+
+    logger.warning("[KAMELEO] Авто-прохождение не сработало — переходим в ручной режим")
+    return wait_manual_captcha(page, logger)
+
 
 def wait_manual_captcha(page, logger) -> bool:
     """Manual CAPTCHA solve - wait for user to solve it"""
