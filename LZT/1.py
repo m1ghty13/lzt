@@ -264,12 +264,70 @@ def wait_manual_captcha(page, logger) -> bool:
     return False
 
 
+CHECKBOX_SELECTORS = [
+    "input[type='checkbox']",
+    "[role='checkbox']",
+    ".ctp-checkbox-label",
+    "label",
+]
+
+
+def _try_click_checkbox(page, logger) -> bool:
+    """Попытаться кликнуть чекбокс Turnstile всеми доступными методами."""
+
+    # Метод 1: frame_locator — Playwright сам находит вложенные iframes
+    for pattern in ["iframe[src*='challenges.cloudflare.com']",
+                    "iframe[src*='turnstile']",
+                    "iframe[title*='Widget']"]:
+        try:
+            fl = page.frame_locator(pattern).first
+            for sel in CHECKBOX_SELECTORS:
+                try:
+                    el = fl.locator(sel).first
+                    if el.count() > 0:
+                        el.click(timeout=2000)
+                        logger.info(f"[CLICK] frame_locator({pattern}) → {sel}")
+                        return True
+                except Exception:
+                    continue
+        except Exception:
+            continue
+
+    # Метод 2: page.frames — явный поиск по URL фрейма
+    all_frames = page.frames
+    logger.debug(f"[CLICK] Фреймы: {[f.url[:60] for f in all_frames]}")
+    for frame in all_frames:
+        if "challenges.cloudflare.com" in frame.url or "turnstile" in frame.url:
+            for sel in CHECKBOX_SELECTORS:
+                try:
+                    el = frame.query_selector(sel)
+                    if el:
+                        el.click()
+                        logger.info(f"[CLICK] page.frames → {sel}")
+                        return True
+                except Exception:
+                    continue
+
+    # Метод 3: прямой клик на странице (виджет может быть не в iframe)
+    for sel in CHECKBOX_SELECTORS:
+        try:
+            el = page.query_selector(sel)
+            if el and el.is_visible():
+                el.click()
+                logger.info(f"[CLICK] page direct → {sel}")
+                return True
+        except Exception:
+            continue
+
+    return False
+
+
 def handle_cloudflare_turnstile(page, logger, **_) -> bool:
     """Обработка Cloudflare Challenge.
 
-    Один реактивный цикл (каждые 0.5s):
-    - Если появился чекбокс → кликаем сразу
-    - Если появился cf_clearance → готово
+    Реактивный цикл (каждые 0.5s):
+    - Пробуем кликнуть чекбокс всеми методами
+    - Если cf_clearance появился И challenge ушёл → готово
     - Через 90s → ручной fallback
     """
     if not is_challenge_page(page):
@@ -277,42 +335,31 @@ def handle_cloudflare_turnstile(page, logger, **_) -> bool:
 
     logger.info("[CAPTCHA] Cloudflare Challenge — мониторим чекбокс и cf_clearance...")
 
-    CHECKBOX_SELECTORS = [
-        "input[type='checkbox']",
-        "[role='checkbox']",
-        ".ctp-checkbox-label",
-        "label",
-    ]
-
     start = time.time()
     timeout = 90
     checkbox_clicked = False
     last_log = 0
+    clearance_before = _has_cf_clearance(page)
 
     while time.time() - start < timeout:
         try:
-            # Проверяем cf_clearance
-            if _has_cf_clearance(page) and not is_challenge_page(page):
-                logger.info("[CAPTCHA] cf_clearance получен — challenge пройден!")
+            has_clearance = _has_cf_clearance(page)
+            on_challenge = is_challenge_page(page)
+
+            # Считаем пройденным только если получили НОВЫЙ clearance или ушли со страницы
+            if has_clearance and not on_challenge:
+                logger.info("[CAPTCHA] Challenge пройден!")
                 return True
 
-            # Ищем чекбокс через page.frames (надёжнее DOM-селектора)
+            # Получили новый clearance — страница сейчас перегружается
+            if has_clearance and not clearance_before:
+                logger.info("[CAPTCHA] Новый cf_clearance получен, ждём редиректа...")
+
+            # Пробуем кликнуть чекбокс
             if not checkbox_clicked:
-                cf_frames = [f for f in page.frames if "challenges.cloudflare.com" in f.url]
-                for cf_frame in cf_frames:
-                    for sel in CHECKBOX_SELECTORS:
-                        try:
-                            el = cf_frame.query_selector(sel)
-                            if el and el.is_visible():
-                                logger.info(f"[CLICK] Чекбокс найден ({sel}) — кликаем!")
-                                el.click()
-                                checkbox_clicked = True
-                                logger.info("[CLICK] Клик выполнен, ждём cf_clearance...")
-                                break
-                        except Exception:
-                            continue
-                    if checkbox_clicked:
-                        break
+                if _try_click_checkbox(page, logger):
+                    checkbox_clicked = True
+                    logger.info("[CLICK] Клик выполнен — ждём cf_clearance...")
 
         except Exception:
             pass
