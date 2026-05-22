@@ -18,7 +18,7 @@ RESULTS_FOLDER = r"C:\Users\gogog\Downloads\Xivora\LZT\results"
 
 # CAPTCHA Config
 CAPTCHA_API_KEY   = "852675d7f72a99e3047e8ba106177696"  # 2Captcha key (не решает managed CF)
-ANTICAPTCHA_KEY   = ""   # anti-captcha.com — вставь сюда свой ключ
+ANTICAPTCHA_KEY   = "e0fe260bd3a002f4ac96dd37d38e5b72"   # anti-captcha.com
 CAPSOLVER_API_KEY = ""   # capsolver.com — опционально
 PROXY_STRING = "38.49.216.136:34181:DVS6xh9vgn:pVa387P"  # SOCKS5 proxy
 
