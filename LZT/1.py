@@ -265,59 +265,117 @@ def wait_manual_captcha(page, logger) -> bool:
 
 
 CHECKBOX_SELECTORS = [
-    "input[type='checkbox']",
-    "[role='checkbox']",
-    ".ctp-checkbox-label",
-    "label",
+    'input[type="checkbox"]',
+    '[role="checkbox"]',
+    'label > input',
+    '.ctp-checkbox-label',
+    'label',
 ]
 
 
 def _try_click_checkbox(page, logger) -> bool:
     """Попытаться кликнуть чекбокс Turnstile всеми доступными методами."""
 
-    # Метод 1: frame_locator — Playwright сам находит вложенные iframes
-    for pattern in ["iframe[src*='challenges.cloudflare.com']",
-                    "iframe[src*='turnstile']",
-                    "iframe[title*='Widget']"]:
-        try:
-            fl = page.frame_locator(pattern).first
-            for sel in CHECKBOX_SELECTORS:
-                try:
-                    el = fl.locator(sel).first
-                    if el.count() > 0:
-                        el.click(timeout=2000)
-                        logger.info(f"[CLICK] frame_locator({pattern}) → {sel}")
-                        return True
-                except Exception:
-                    continue
-        except Exception:
-            continue
-
-    # Метод 2: page.frames — явный поиск по URL фрейма
-    all_frames = page.frames
-    logger.debug(f"[CLICK] Фреймы: {[f.url[:60] for f in all_frames]}")
-    for frame in all_frames:
-        if "challenges.cloudflare.com" in frame.url or "turnstile" in frame.url:
-            for sel in CHECKBOX_SELECTORS:
-                try:
-                    el = frame.query_selector(sel)
-                    if el:
-                        el.click()
-                        logger.info(f"[CLICK] page.frames → {sel}")
-                        return True
-                except Exception:
-                    continue
-
-    # Метод 3: прямой клик на странице (виджет может быть не в iframe)
-    for sel in CHECKBOX_SELECTORS:
-        try:
-            el = page.query_selector(sel)
-            if el and el.is_visible():
-                el.click()
-                logger.info(f"[CLICK] page direct → {sel}")
+    # Стратегия 1: поиск по тексту "Verify you are human"
+    try:
+        verify_label = page.locator('text=Verify you are human')
+        if verify_label.count() > 0:
+            parent = verify_label.locator(
+                'xpath=./ancestor::*[contains(@class,"checkboxLabel") or contains(@class,"mark")]'
+            )
+            if parent.count() > 0:
+                parent.click()
+                logger.info("[CLICK] S1: клик по родителю label 'Verify you are human'")
                 return True
-        except Exception:
-            continue
+    except Exception:
+        pass
+
+    # Стратегия 2: перебор всех iframe по индексу (nth) — самый надёжный способ
+    try:
+        iframes = page.query_selector_all('iframe')
+        logger.info(f"[CLICK] S2: найдено iframe: {len(iframes)}")
+        for i, iframe_el in enumerate(iframes):
+            src = iframe_el.get_attribute('src') or ''
+            logger.debug(f"[CLICK] S2 iframe[{i}]: {src[:80]}")
+            frame = page.frame_locator(f'iframe >> nth={i}')
+            for sel in CHECKBOX_SELECTORS:
+                try:
+                    cb = frame.locator(sel)
+                    if cb.count() > 0:
+                        cb.click(timeout=2000)
+                        logger.info(f"[CLICK] S2: iframe[{i}] → {sel}")
+                        return True
+                except Exception:
+                    continue
+    except Exception as e:
+        logger.debug(f"[CLICK] S2 error: {e}")
+
+    # Стратегия 3: page.frames по URL
+    try:
+        for frame in page.frames:
+            if "challenges.cloudflare.com" in frame.url or "turnstile" in frame.url:
+                for sel in CHECKBOX_SELECTORS:
+                    try:
+                        el = frame.query_selector(sel)
+                        if el:
+                            el.click()
+                            logger.info(f"[CLICK] S3: page.frames → {sel}")
+                            return True
+                    except Exception:
+                        continue
+    except Exception as e:
+        logger.debug(f"[CLICK] S3 error: {e}")
+
+    # Стратегия 4: JavaScript клик напрямую на странице
+    try:
+        result = page.evaluate("""
+            () => {
+                let cb = document.querySelector('input[type="checkbox"]');
+                if (cb) { cb.click(); cb.dispatchEvent(new Event('change',{bubbles:true})); return 'checkbox'; }
+                let aria = document.querySelector('[aria-label*="Verify"]');
+                if (aria) { aria.click(); return 'aria'; }
+                return null;
+            }
+        """)
+        if result:
+            logger.info(f"[CLICK] S4: JS click → {result}")
+            return True
+    except Exception as e:
+        logger.debug(f"[CLICK] S4 error: {e}")
+
+    # Стратегия 5: Tab + Space (клавиатурная активация)
+    try:
+        page.keyboard.press('Tab')
+        time.sleep(0.3)
+        page.keyboard.press('Space')
+        logger.info("[CLICK] S5: Tab+Space")
+        return True
+    except Exception as e:
+        logger.debug(f"[CLICK] S5 error: {e}")
+
+    # Стратегия 6: клик по координатам (центр и типичные позиции виджета)
+    try:
+        vp = page.viewport_size or {"width": 1280, "height": 800}
+        w, h = vp["width"], vp["height"]
+        positions = [
+            (int(w * 0.5),  int(h * 0.5)),
+            (int(w * 0.75), int(h * 0.5)),
+            (int(w * 0.5),  int(h * 0.45)),
+            (int(w * 0.5),  int(h * 0.55)),
+            (int(w * 0.25), int(h * 0.5)),
+        ]
+        for x, y in positions:
+            try:
+                page.mouse.click(x, y)
+                time.sleep(0.5)
+                if not is_challenge_page(page):
+                    logger.info(f"[CLICK] S6: координаты ({x},{y}) — challenge ушёл!")
+                    return True
+            except Exception:
+                continue
+        logger.info("[CLICK] S6: координаты не помогли")
+    except Exception as e:
+        logger.debug(f"[CLICK] S6 error: {e}")
 
     return False
 
@@ -333,7 +391,19 @@ def handle_cloudflare_turnstile(page, logger, **_) -> bool:
     if not is_challenge_page(page):
         return True
 
-    logger.info("[CAPTCHA] Cloudflare Challenge — мониторим чекбокс и cf_clearance...")
+    logger.info("[CAPTCHA] Cloudflare Challenge — ждём рендера и кликаем чекбокс...")
+
+    # Ждём появления iframe или чекбокса (до 15s)
+    try:
+        page.wait_for_function(
+            '() => document.querySelectorAll("iframe").length > 0 '
+            '|| !!document.querySelector("input[type=\\"checkbox\\"]")',
+            timeout=15000,
+        )
+        logger.info("[CAPTCHA] UI готов")
+        time.sleep(1.5)
+    except Exception:
+        logger.info("[CAPTCHA] iframe не появился за 15s — пробуем всё равно")
 
     start = time.time()
     timeout = 90
