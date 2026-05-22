@@ -1018,8 +1018,12 @@ def wait_kameleo_autopass(page, logger, timeout=90) -> bool:
     while time.time() - start < timeout:
         try:
             if not is_challenge_page(page):
-                logger.info("[KAMELEO] Challenge авто-пройден!")
-                return True
+                # Двойная проверка: страница могла просто перезагружаться
+                time.sleep(3)
+                if not is_challenge_page(page):
+                    logger.info("[KAMELEO] Challenge пройден!")
+                    return True
+                # Это была промежуточная перезагрузка — продолжаем ждать
         except Exception:
             return True  # страница закрылась/сменилась — считаем успехом
 
@@ -1411,17 +1415,19 @@ def main(file_number=1):
                             break
 
                     elif state == "unknown":
-                        # Redirect still loading, or final success page
-                        logger.info(f"Неизвестная страница ({page.url}) — ждём навигации...")
-                        try:
-                            old_url = page.url
-                            page.wait_for_function(
-                                f"() => window.location.href !== {repr(old_url)}",
-                                timeout=10000,
-                            )
-                            wait_for_page(page, logger)
-                        except Exception:
-                            logger.info("Навигации не было — завершение")
+                        # Форма могла загрузиться через JS без смены URL.
+                        # Ждём до 15s пока состояние изменится через DOM.
+                        logger.info(f"Неизвестная страница ({page.url}) — ждём изменения DOM...")
+                        resolved = False
+                        for _ in range(15):
+                            time.sleep(1)
+                            new_state = get_page_state(page, logger)
+                            if new_state != "unknown":
+                                logger.info(f"Состояние изменилось: {new_state}")
+                                resolved = True
+                                break
+                        if not resolved:
+                            logger.info("Состояние не изменилось за 15s — завершение")
                             break
 
                 logger.info("=" * 60)
