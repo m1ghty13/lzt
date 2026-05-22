@@ -17,8 +17,9 @@ SPEED_FACTOR = 1
 RESULTS_FOLDER = r"C:\Users\gogog\Downloads\Xivora\LZT\results"
 
 # CAPTCHA Config
-CAPTCHA_API_KEY  = "852675d7f72a99e3047e8ba106177696"  # 2Captcha API key
-CAPSOLVER_API_KEY = ""  # CapSolver key (capsolver.com) — нужен для managed challenge
+CAPTCHA_API_KEY   = "852675d7f72a99e3047e8ba106177696"  # 2Captcha key (не решает managed CF)
+ANTICAPTCHA_KEY   = ""   # anti-captcha.com — вставь сюда свой ключ
+CAPSOLVER_API_KEY = ""   # capsolver.com — опционально
 PROXY_STRING = "38.49.216.136:34181:DVS6xh9vgn:pVa387P"  # SOCKS5 proxy
 
 # ---- Logging setup ----
@@ -304,6 +305,64 @@ def _submit_2captcha_task(task: dict, logger) -> str | None:
     return None
 
 
+def _solve_via_anticaptcha(page_url: str, sitekey: str, logger,
+                            pagedata=None) -> str | None:
+    """Решить Cloudflare Turnstile/Managed Challenge через Anti-Captcha."""
+    if not ANTICAPTCHA_KEY:
+        return None
+    try:
+        task = {
+            "type": "TurnstileTaskProxyless",
+            "websiteURL": page_url,
+            "websiteKey": sitekey,
+        }
+        if pagedata:
+            task["pagedata"] = pagedata
+
+        logger.info(f"[AntiCaptcha] Отправка задачи sitekey={sitekey[:20]}...")
+        resp = requests.post(
+            "https://api.anti-captcha.com/createTask",
+            json={"clientKey": ANTICAPTCHA_KEY, "task": task},
+            timeout=30,
+        ).json()
+        logger.info(f"[AntiCaptcha] Ответ createTask: {resp}")
+
+        if resp.get("errorId"):
+            logger.warning(f"[AntiCaptcha] Ошибка: {resp.get('errorDescription')}")
+            return None
+
+        task_id = resp.get("taskId")
+        if not task_id:
+            logger.warning(f"[AntiCaptcha] Нет taskId: {resp}")
+            return None
+
+        logger.info(f"[AntiCaptcha] Task {task_id} — ожидание...")
+        for attempt in range(36):
+            time.sleep(5)
+            result = requests.post(
+                "https://api.anti-captcha.com/getTaskResult",
+                json={"clientKey": ANTICAPTCHA_KEY, "taskId": task_id},
+                timeout=30,
+            ).json()
+            if result.get("errorId"):
+                logger.warning(f"[AntiCaptcha] Poll error: {result.get('errorDescription')}")
+                return None
+            if result.get("status") == "ready":
+                token = result.get("solution", {}).get("token")
+                if token:
+                    logger.info(f"[AntiCaptcha] Токен получен: {token[:40]}...")
+                    return token
+                logger.warning(f"[AntiCaptcha] Нет токена: {result}")
+                return None
+            if attempt % 6 == 0:
+                logger.info(f"[AntiCaptcha] Ожидание... {attempt * 5}s")
+        logger.warning("[AntiCaptcha] Таймаут")
+        return None
+    except Exception as e:
+        logger.error(f"[AntiCaptcha] Ошибка: {e}")
+        return None
+
+
 def _clean_cf_url(page_url: str) -> str:
     """Убрать CF-challenge токены из URL перед отправкой в сервис решения."""
     from urllib.parse import urlparse, urlencode, parse_qs, urlunparse
@@ -431,7 +490,14 @@ def solve_cloudflare_api(page_url: str, sitekey: str, logger,
     clean_url = _clean_cf_url(page_url)
     logger.info(f"[captcha] URL: {clean_url}  sitekey: {sitekey[:20]}  pagedata: {'да' if pagedata else 'нет'}")
 
-    # 1. CapSolver
+    # 1. Anti-Captcha (лучший для managed CF challenge)
+    if ANTICAPTCHA_KEY:
+        token = _solve_via_anticaptcha(clean_url, sitekey, logger, pagedata)
+        if token:
+            return token
+        logger.info("[captcha] Anti-Captcha не сработал — пробуем следующий...")
+
+    # 2. CapSolver
     if CAPSOLVER_API_KEY:
         token = _solve_via_capsolver(clean_url, sitekey, logger, pagedata)
         if token:
