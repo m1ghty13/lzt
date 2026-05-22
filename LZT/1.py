@@ -305,62 +305,94 @@ def _submit_2captcha_task(task: dict, logger) -> str | None:
     return None
 
 
-def _solve_via_anticaptcha(page_url: str, sitekey: str, logger,
-                            pagedata=None) -> str | None:
-    """Решить Cloudflare Turnstile/Managed Challenge через Anti-Captcha."""
-    if not ANTICAPTCHA_KEY:
-        return None
-    try:
-        task = {
-            "type": "TurnstileTaskProxyless",
-            "websiteURL": page_url,
-            "websiteKey": sitekey,
-        }
-        if pagedata:
-            task["pagedata"] = pagedata
-
-        logger.info(f"[AntiCaptcha] Отправка задачи sitekey={sitekey[:20]}...")
-        resp = requests.post(
-            "https://api.anti-captcha.com/createTask",
-            json={"clientKey": ANTICAPTCHA_KEY, "task": task},
+def _anticaptcha_poll(task_id: int, logger) -> str | None:
+    """Ожидать результат Anti-Captcha задачи."""
+    for attempt in range(36):
+        time.sleep(5)
+        result = requests.post(
+            "https://api.anti-captcha.com/getTaskResult",
+            json={"clientKey": ANTICAPTCHA_KEY, "taskId": task_id},
             timeout=30,
         ).json()
-        logger.info(f"[AntiCaptcha] Ответ createTask: {resp}")
-
-        if resp.get("errorId"):
-            logger.warning(f"[AntiCaptcha] Ошибка: {resp.get('errorDescription')}")
+        if result.get("errorId"):
+            logger.warning(f"[AntiCaptcha] Poll error: {result.get('errorDescription')}")
             return None
-
-        task_id = resp.get("taskId")
-        if not task_id:
-            logger.warning(f"[AntiCaptcha] Нет taskId: {resp}")
-            return None
-
-        logger.info(f"[AntiCaptcha] Task {task_id} — ожидание...")
-        for attempt in range(36):
-            time.sleep(5)
-            result = requests.post(
-                "https://api.anti-captcha.com/getTaskResult",
-                json={"clientKey": ANTICAPTCHA_KEY, "taskId": task_id},
-                timeout=30,
-            ).json()
-            if result.get("errorId"):
-                logger.warning(f"[AntiCaptcha] Poll error: {result.get('errorDescription')}")
-                return None
-            if result.get("status") == "ready":
-                token = result.get("solution", {}).get("token")
-                if token:
-                    logger.info(f"[AntiCaptcha] Токен получен: {token[:40]}...")
-                    return token
+        if result.get("status") == "ready":
+            token = result.get("solution", {}).get("token")
+            if token:
+                logger.info(f"[AntiCaptcha] Токен получен: {token[:40]}...")
+            else:
                 logger.warning(f"[AntiCaptcha] Нет токена: {result}")
-                return None
-            if attempt % 6 == 0:
-                logger.info(f"[AntiCaptcha] Ожидание... {attempt * 5}s")
-        logger.warning("[AntiCaptcha] Таймаут")
+            return token
+        if attempt % 6 == 0:
+            logger.info(f"[AntiCaptcha] Ожидание... {attempt * 5}s")
+    logger.warning("[AntiCaptcha] Таймаут")
+    return None
+
+
+def _anticaptcha_submit(task: dict, logger) -> str | None:
+    """Отправить задачу в Anti-Captcha и вернуть токен."""
+    import json as _j
+    logger.info(f"[AntiCaptcha] Запрос: {_j.dumps({'clientKey': '***', 'task': task}, ensure_ascii=False)}")
+    resp = requests.post(
+        "https://api.anti-captcha.com/createTask",
+        json={"clientKey": ANTICAPTCHA_KEY, "task": task},
+        timeout=30,
+    ).json()
+    logger.info(f"[AntiCaptcha] Ответ: {resp}")
+    if resp.get("errorId"):
+        logger.warning(f"[AntiCaptcha] Ошибка: {resp.get('errorDescription')}")
         return None
-    except Exception as e:
-        logger.error(f"[AntiCaptcha] Ошибка: {e}")
+    task_id = resp.get("taskId")
+    if not task_id:
         return None
+    logger.info(f"[AntiCaptcha] Task {task_id} — ожидание...")
+    return _anticaptcha_poll(task_id, logger)
+
+
+def _solve_via_anticaptcha(page_url: str, sitekey: str, logger,
+                            pagedata=None, cdata=None, action=None,
+                            proxy_host=None, proxy_port=None,
+                            proxy_user=None, proxy_pass=None) -> str | None:
+    """Решить Cloudflare Turnstile/Managed Challenge через Anti-Captcha.
+
+    Сначала пробует ProxyLess, при ошибке — с прокси (TurnstileTask).
+    """
+    if not ANTICAPTCHA_KEY:
+        return None
+
+    def build_task(task_type: str, **extra) -> dict:
+        t = {"type": task_type, "websiteURL": page_url, "websiteKey": sitekey}
+        if action:
+            t["action"] = action
+        if cdata:
+            t["cData"] = cdata          # правильное имя поля по доке Anti-Captcha
+        if pagedata:
+            t["chlPageData"] = pagedata  # правильное имя поля по доке Anti-Captcha
+        t.update(extra)
+        return t
+
+    # Попытка 1: TurnstileTaskProxyless
+    token = _anticaptcha_submit(build_task("TurnstileTaskProxyless"), logger)
+    if token:
+        return token
+
+    # Попытка 2: TurnstileTask с прокси (если есть)
+    if proxy_host and proxy_port:
+        logger.info("[AntiCaptcha] ProxyLess не сработал — пробуем с прокси...")
+        proxy_task = build_task(
+            "TurnstileTask",
+            proxyType="socks5",
+            proxyAddress=proxy_host,
+            proxyPort=int(proxy_port),
+            proxyLogin=proxy_user or "",
+            proxyPassword=proxy_pass or "",
+        )
+        token = _anticaptcha_submit(proxy_task, logger)
+        if token:
+            return token
+
+    return None
 
 
 def _clean_cf_url(page_url: str) -> str:
@@ -479,7 +511,8 @@ def _solve_via_2captcha_form(page_url: str, sitekey: str, logger) -> str | None:
 def solve_cloudflare_api(page_url: str, sitekey: str, logger,
                          proxy_host: str = None, proxy_port: int = None,
                          proxy_user: str = None, proxy_pass: str = None,
-                         pagedata: str = None) -> str:
+                         pagedata: str = None, cdata: str = None,
+                         action: str = None) -> str:
     """Решить Cloudflare Turnstile/Managed Challenge.
 
     Порядок попыток:
@@ -492,7 +525,12 @@ def solve_cloudflare_api(page_url: str, sitekey: str, logger,
 
     # 1. Anti-Captcha (лучший для managed CF challenge)
     if ANTICAPTCHA_KEY:
-        token = _solve_via_anticaptcha(clean_url, sitekey, logger, pagedata)
+        token = _solve_via_anticaptcha(
+            clean_url, sitekey, logger,
+            pagedata=pagedata, cdata=cdata, action=action,
+            proxy_host=proxy_host, proxy_port=proxy_port,
+            proxy_user=proxy_user, proxy_pass=proxy_pass,
+        )
         if token:
             return token
         logger.info("[captcha] Anti-Captcha не сработал — пробуем следующий...")
@@ -921,14 +959,19 @@ def handle_cloudflare_turnstile(page, logger, account_data: dict = None) -> bool
         except Exception as e:
             logger.debug(f"[CAPTCHA] Не удалось прочитать _cf_chl_opt: {e}")
 
-        sitekey = cf_params.get("sitekey") or get_turnstile_sitekey(page, logger)
+        sitekey  = cf_params.get("sitekey")  or get_turnstile_sitekey(page, logger)
         pagedata = cf_params.get("pagedata")
+        cdata    = cf_params.get("cdata")
+        action   = cf_params.get("action")
 
         if not sitekey:
             logger.warning("[CAPTCHA] Sitekey не найден — ждём ручного решения")
             return wait_manual_captcha(page, logger)
 
-        logger.info(f"[CAPTCHA] sitekey={sitekey}  pagedata={'да' if pagedata else 'нет'}")
+        logger.info(f"[CAPTCHA] sitekey={sitekey}  "
+                    f"pagedata={'да' if pagedata else 'нет'}  "
+                    f"cdata={'да' if cdata else 'нет'}  "
+                    f"action={action}")
 
         # Прокси из account_data
         proxy_host = proxy_port = proxy_user = proxy_pass = None
@@ -942,7 +985,7 @@ def handle_cloudflare_turnstile(page, logger, account_data: dict = None) -> bool
             page.url, sitekey, logger,
             proxy_host=proxy_host, proxy_port=proxy_port,
             proxy_user=proxy_user, proxy_pass=proxy_pass,
-            pagedata=pagedata,
+            pagedata=pagedata, cdata=cdata, action=action,
         )
 
         if not token:
