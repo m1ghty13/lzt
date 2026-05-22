@@ -264,79 +264,72 @@ def wait_manual_captcha(page, logger) -> bool:
     return False
 
 
-def try_click_challenge_checkbox(page, logger) -> bool:
-    """Найти и кликнуть чекбокс внутри Cloudflare Turnstile iframe."""
-    try:
-        # Ждём появления iframe (до 12 секунд)
-        logger.info("[CLICK] Ищем iframe Cloudflare challenge...")
-        try:
-            page.wait_for_selector(
-                "iframe[src*='challenges.cloudflare.com']",
-                timeout=12000,
-                state="attached",
-            )
-            time.sleep(1.5)  # дать содержимому iframe прогрузиться
-        except Exception:
-            # Может быть в page.frames без src-атрибута в DOM
-            cf_frames = [f for f in page.frames if "challenges.cloudflare.com" in f.url]
-            if not cf_frames:
-                logger.info("[CLICK] CF iframe не найден")
-                return False
-
-        frame = page.frame_locator("iframe[src*='challenges.cloudflare.com']").first
-
-        # Селекторы чекбокса внутри Turnstile (порядок от наиболее специфичного)
-        selectors = [
-            "input[type='checkbox']",
-            "[role='checkbox']",
-            ".ctp-checkbox-label",
-            "label",
-            "#challenge-stage",
-        ]
-
-        for sel in selectors:
-            try:
-                el = frame.locator(sel).first
-                if el.count() > 0:
-                    logger.info(f"[CLICK] Найден элемент '{sel}' — кликаем...")
-                    el.click(timeout=3000)
-                    logger.info("[CLICK] Клик выполнен")
-                    time.sleep(2)
-                    return True
-            except Exception:
-                continue
-
-        logger.info("[CLICK] Чекбокс не найден — возможно non-interactive challenge")
-        return False
-
-    except Exception as e:
-        logger.debug(f"[CLICK] Ошибка: {e}")
-        return False
-
-
-def handle_cloudflare_turnstile(page, logger, account_data: dict = None) -> bool:
+def handle_cloudflare_turnstile(page, logger, **_) -> bool:
     """Обработка Cloudflare Challenge.
 
-    Порядок:
-    1. Кликнуть чекбокс в iframe (если видим)
-    2. Ждать cf_clearance cookie (авто-прохождение через Kameleo)
-    3. Ручной fallback (5 минут)
+    Один реактивный цикл (каждые 0.5s):
+    - Если появился чекбокс → кликаем сразу
+    - Если появился cf_clearance → готово
+    - Через 90s → ручной fallback
     """
-    try:
-        if not is_challenge_page(page):
-            return True
+    if not is_challenge_page(page):
+        return True
 
-        logger.info("[CAPTCHA] Cloudflare Challenge обнаружен")
+    logger.info("[CAPTCHA] Cloudflare Challenge — мониторим чекбокс и cf_clearance...")
 
-        # Шаг 1: пробуем кликнуть чекбокс
-        try_click_challenge_checkbox(page, logger)
+    CHECKBOX_SELECTORS = [
+        "input[type='checkbox']",
+        "[role='checkbox']",
+        ".ctp-checkbox-label",
+        "label",
+    ]
 
-        # Шаг 2: ждём cf_clearance (авто или после клика)
-        return wait_kameleo_autopass(page, logger)
+    start = time.time()
+    timeout = 90
+    checkbox_clicked = False
+    last_log = 0
 
-    except Exception as e:
-        logger.error(f"[CAPTCHA] Ошибка: {e}")
-        return False
+    while time.time() - start < timeout:
+        try:
+            # Проверяем cf_clearance
+            if _has_cf_clearance(page) and not is_challenge_page(page):
+                logger.info("[CAPTCHA] cf_clearance получен — challenge пройден!")
+                return True
+
+            # Ищем чекбокс через page.frames (надёжнее DOM-селектора)
+            if not checkbox_clicked:
+                cf_frames = [f for f in page.frames if "challenges.cloudflare.com" in f.url]
+                for cf_frame in cf_frames:
+                    for sel in CHECKBOX_SELECTORS:
+                        try:
+                            el = cf_frame.query_selector(sel)
+                            if el and el.is_visible():
+                                logger.info(f"[CLICK] Чекбокс найден ({sel}) — кликаем!")
+                                el.click()
+                                checkbox_clicked = True
+                                logger.info("[CLICK] Клик выполнен, ждём cf_clearance...")
+                                break
+                        except Exception:
+                            continue
+                    if checkbox_clicked:
+                        break
+
+        except Exception:
+            pass
+
+        elapsed = int(time.time() - start)
+        if elapsed - last_log >= 10:
+            logger.info(
+                f"[CAPTCHA] {elapsed}s/{timeout}s | "
+                f"clearance={'да' if _has_cf_clearance(page) else 'нет'} | "
+                f"clicked={'да' if checkbox_clicked else 'нет'}"
+            )
+            last_log = elapsed
+
+        time.sleep(0.5)
+
+    logger.warning("[CAPTCHA] 90s истекло — переходим в ручной режим")
+    return wait_manual_captcha(page, logger)
 
 
 # ---- Contact Button Clicking ----
