@@ -264,13 +264,76 @@ def wait_manual_captcha(page, logger) -> bool:
     return False
 
 
+def try_click_challenge_checkbox(page, logger) -> bool:
+    """Найти и кликнуть чекбокс внутри Cloudflare Turnstile iframe."""
+    try:
+        # Ждём появления iframe (до 12 секунд)
+        logger.info("[CLICK] Ищем iframe Cloudflare challenge...")
+        try:
+            page.wait_for_selector(
+                "iframe[src*='challenges.cloudflare.com']",
+                timeout=12000,
+                state="attached",
+            )
+            time.sleep(1.5)  # дать содержимому iframe прогрузиться
+        except Exception:
+            # Может быть в page.frames без src-атрибута в DOM
+            cf_frames = [f for f in page.frames if "challenges.cloudflare.com" in f.url]
+            if not cf_frames:
+                logger.info("[CLICK] CF iframe не найден")
+                return False
+
+        frame = page.frame_locator("iframe[src*='challenges.cloudflare.com']").first
+
+        # Селекторы чекбокса внутри Turnstile (порядок от наиболее специфичного)
+        selectors = [
+            "input[type='checkbox']",
+            "[role='checkbox']",
+            ".ctp-checkbox-label",
+            "label",
+            "#challenge-stage",
+        ]
+
+        for sel in selectors:
+            try:
+                el = frame.locator(sel).first
+                if el.count() > 0:
+                    logger.info(f"[CLICK] Найден элемент '{sel}' — кликаем...")
+                    el.click(timeout=3000)
+                    logger.info("[CLICK] Клик выполнен")
+                    time.sleep(2)
+                    return True
+            except Exception:
+                continue
+
+        logger.info("[CLICK] Чекбокс не найден — возможно non-interactive challenge")
+        return False
+
+    except Exception as e:
+        logger.debug(f"[CLICK] Ошибка: {e}")
+        return False
+
+
 def handle_cloudflare_turnstile(page, logger, account_data: dict = None) -> bool:
-    """Обработка Cloudflare Challenge — авто через Kameleo, ручной fallback."""
+    """Обработка Cloudflare Challenge.
+
+    Порядок:
+    1. Кликнуть чекбокс в iframe (если видим)
+    2. Ждать cf_clearance cookie (авто-прохождение через Kameleo)
+    3. Ручной fallback (5 минут)
+    """
     try:
         if not is_challenge_page(page):
             return True
-        logger.info("[CAPTCHA] Cloudflare Challenge — ждём прохождения через Kameleo...")
+
+        logger.info("[CAPTCHA] Cloudflare Challenge обнаружен")
+
+        # Шаг 1: пробуем кликнуть чекбокс
+        try_click_challenge_checkbox(page, logger)
+
+        # Шаг 2: ждём cf_clearance (авто или после клика)
         return wait_kameleo_autopass(page, logger)
+
     except Exception as e:
         logger.error(f"[CAPTCHA] Ошибка: {e}")
         return False
