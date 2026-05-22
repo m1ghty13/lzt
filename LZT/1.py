@@ -1007,33 +1007,52 @@ def handle_cloudflare_turnstile(page, logger, account_data: dict = None) -> bool
         logger.error(f"[CAPTCHA] Ошибка: {e}")
         return False
 
+def _has_cf_clearance(page) -> bool:
+    """Проверить наличие cookie cf_clearance — единственный надёжный признак прохождения CF."""
+    try:
+        return any(c["name"] == "cf_clearance" for c in page.context.cookies())
+    except Exception:
+        return False
+
+
 def wait_kameleo_autopass(page, logger, timeout=90) -> bool:
-    """Ждём авто-прохождения Cloudflare managed challenge через Kameleo fingerprinting.
-    Если за timeout секунд не прошло — переходим в ручной режим.
+    """Ждём авто-прохождения Cloudflare challenge.
+
+    Надёжный признак — появление cf_clearance cookie + страница НЕ challenge.
+    Простая проверка заголовка ненадёжна: CF перезагружает страницу несколько раз
+    внутри challenge, и заголовок кратко меняется — это не прохождение.
     """
-    logger.info(f"[KAMELEO] Ждём авто-прохождения challenge ({timeout}s)...")
+    already_had = _has_cf_clearance(page)
+    logger.info(f"[KAMELEO] Ждём cf_clearance cookie ({timeout}s) "
+                f"[уже был: {already_had}]...")
     start = time.time()
     last_log = 0
 
     while time.time() - start < timeout:
         try:
-            if not is_challenge_page(page):
-                # Двойная проверка: страница могла просто перезагружаться
-                time.sleep(3)
-                if not is_challenge_page(page):
-                    logger.info("[KAMELEO] Challenge пройден!")
-                    return True
-                # Это была промежуточная перезагрузка — продолжаем ждать
-        except Exception:
-            return True  # страница закрылась/сменилась — считаем успехом
+            got_clearance = _has_cf_clearance(page)
+            not_challenge = not is_challenge_page(page)
 
-        elapsed = int(time.time() - start)
-        if elapsed - last_log >= 10:
-            logger.info(f"[KAMELEO] Ожидание авто-прохождения... {elapsed}s/{timeout}s")
-            last_log = elapsed
+            if got_clearance and not_challenge:
+                logger.info("[KAMELEO] cf_clearance получен + challenge прошёл!")
+                return True
+
+            # Кратко логируем промежуточное состояние
+            elapsed = int(time.time() - start)
+            if elapsed - last_log >= 10:
+                logger.info(f"[KAMELEO] {elapsed}s/{timeout}s | "
+                            f"cf_clearance={'да' if got_clearance else 'нет'} | "
+                            f"challenge={'да' if not not_challenge else 'нет'}")
+                last_log = elapsed
+
+        except Exception:
+            return True  # страница/браузер закрылись
+
         time.sleep(1)
 
-    logger.warning("[KAMELEO] Авто-прохождение не сработало — переходим в ручной режим")
+    logger.warning("[KAMELEO] cf_clearance не появился за 90s — переходим в ручной режим")
+    logger.warning("[KAMELEO] Датацентровые прокси часто блокируются Cloudflare. "
+                   "Для авто-прохождения нужны residential прокси.")
     return wait_manual_captcha(page, logger)
 
 
