@@ -2,6 +2,7 @@ from playwright.sync_api import sync_playwright, TimeoutError
 from kameleo.local_api_client import KameleoLocalApiClient
 from kameleo.local_api_client.models import CreateProfileRequest, ProxyChoice, Server
 import os
+import re
 import time
 import random
 import sys
@@ -169,255 +170,192 @@ def read_account_file(file_number=1):
 # ---- CAPTCHA Handling ----
 def get_turnstile_sitekey(page, logger) -> str:
     """Извлечь sitekey со страницы"""
+    # Метод 1: _cf_chl_opt.IThaC9 — самый надёжный для Cloudflare WAF
     try:
-        # Сначала дождемся пока Turnstile загрузится (может быть несколько iframe'ов на странице)
-        logger.info("[SITEKEY] Waiting for Turnstile to load...")
-        try:
-            page.wait_for_function(
-                "() => document.querySelectorAll('iframe').length > 0",
-                timeout=10000
-            )
-            logger.info("[SITEKEY] Turnstile iframe detected - proceeding with extraction")
-            time.sleep(1)  # Give it extra time to fully initialize
-        except:
-            logger.warning("[SITEKEY] Timeout waiting for iframe - continuing anyway")
+        page.wait_for_function("!!window._cf_chl_opt?.IThaC9", timeout=3000)
+        key = page.evaluate("window._cf_chl_opt.IThaC9")
+        if key:
+            logger.info(f"[SITEKEY] Found via _cf_chl_opt.IThaC9: {key}")
+            return key
+    except Exception:
+        pass
 
+    # Метод 2: regex на URL фреймов challenges.cloudflare.com
+    try:
+        for frame in page.frames:
+            if "challenges.cloudflare.com" in frame.url:
+                m = re.search(r"/(0x[A-Za-z0-9]{10,})/", frame.url)
+                if m:
+                    logger.info(f"[SITEKEY] Found via frame URL: {m.group(1)}")
+                    return m.group(1)
+    except Exception:
+        pass
+
+    # Метод 3: ждём iframe и ищем через JS
+    try:
+        page.wait_for_function(
+            "() => document.querySelectorAll('iframe').length > 0",
+            timeout=10000
+        )
+        time.sleep(1)
+    except Exception:
+        logger.warning("[SITEKEY] Timeout waiting for iframe - continuing anyway")
+
+    try:
         sitekey = page.evaluate("""
             () => {
-                // Способ 1: data-sitekey атрибут
+                // data-sitekey атрибут
                 let el = document.querySelector('[data-sitekey]');
                 if (el) return el.getAttribute('data-sitekey');
 
-                // Способ 2: cf-turnstile контейнер
-                let turnstile = document.querySelector('[data-sitekey], .cf-turnstile, #cf-turnstile, [id*="turnstile"]');
-                if (turnstile && turnstile.getAttribute('data-sitekey')) {
-                    return turnstile.getAttribute('data-sitekey');
+                // iframe src атрибут
+                for (let iframe of document.querySelectorAll('iframe')) {
+                    let src = iframe.src || '';
+                    let m = src.match(/(0x[A-Za-z0-9]{10,})/);
+                    if (m) return m[1];
+                    m = src.match(/[?&]k=([A-Za-z0-9_-]+)/);
+                    if (m) return m[1];
                 }
 
-                // Способ 3: проверить все iframes (все, не только с turnstile)
-                let iframes = document.querySelectorAll('iframe');
-                for (let iframe of iframes) {
-                    let src = iframe.src;
-                    let match = src.match(/key=([A-Za-z0-9_-]+)/);
-                    if (match) return match[1];
-                    match = src.match(/sitekey=([A-Za-z0-9_-]+)/);
-                    if (match) return match[1];
+                // window globals
+                if (window._cf_chl_opt) {
+                    let o = window._cf_chl_opt;
+                    return o.IThaC9 || o.websiteKey || o.sitekey || null;
                 }
 
-                // Способ 4: window объект и глобальные переменные
-                if (window.turnstileKey) return window.turnstileKey;
-                if (window.challengeSitekey) return window.challengeSitekey;
-                if (window._cf_chl_opt && window._cf_chl_opt.websiteKey) return window._cf_chl_opt.websiteKey;
-                if (window._cf_chl_opt && window._cf_chl_opt.sitekey) return window._cf_chl_opt.sitekey;
-
-                // Способ 5: поискать в скриптах - АГРЕССИВНЫЙ ПОИСК
-                let scripts = document.querySelectorAll('script');
-                for (let script of scripts) {
-                    let text = script.textContent;
-                    // Cloudflare IThaC9 (websiteKey в конфиге)
-                    let match = text.match(/IThaC9['\"]?\\s*:\\s*['\"]([^'\"]+)['\"]/);
-                    if (match) return match[1];
-                    // Общий поиск sitekey
-                    match = text.match(/['\"]sitekey['\"]\\s*:\\s*['\"]([^'\"]+)['\"]/);
-                    if (match) return match[1];
-                    match = text.match(/websiteKey['\"]?\\s*:\\s*['\"]([^'\"]+)['\"]/);
-                    if (match) return match[1];
-                    // Поиск hex строк которые выглядят как sitekey
-                    match = text.match(/['\"]([0-9a-f]{32,})['\"]|['\"]([0-9]{1}x[A-Za-z0-9]{27,})['\"]|IThaC9['\"]\\s*:\\s*['\"]([^'\"]+)['\"]/);
-                    if (match) {
-                        let potential = match[1] || match[2] || match[3];
-                        if (potential && potential.length > 20) return potential;
-                    }
-                }
-
-                // Способ 6: использовать стандартный Cloudflare sitekey если ничего не найдено
-                return '0x4AAAAAAAAjq6WYeRDKmebM';
+                return null;
             }
         """)
         if sitekey:
-            logger.info(f"Sitekey найден: {sitekey}")
+            logger.info(f"[SITEKEY] Found via JS: {sitekey}")
             return sitekey
-        else:
-            # Добавим диагностику если sitekey не найден
-            logger.warning("[SITEKEY] Not found - dumping page structure for debugging")
-            try:
-                page_info = page.evaluate("""
-                    () => {
-                        let info = {
-                            elements_with_data_sitekey: document.querySelectorAll('[data-sitekey]').length,
-                            cf_turnstile_divs: document.querySelectorAll('.cf-turnstile').length,
-                            turnstile_iframes: document.querySelectorAll('iframe[src*="turnstile"]').length,
-                            challenge_iframes: document.querySelectorAll('iframe[src*="challenges"]').length,
-                            all_iframes: document.querySelectorAll('iframe').length,
-                            all_divs_with_id: document.querySelectorAll('div[id]').length,
-                            page_html_length: document.documentElement.outerHTML.length,
-                            body_html_length: document.body.outerHTML.length
-                        };
-
-                        // Получить первые несколько iframe src для логирования
-                        let iframes = document.querySelectorAll('iframe');
-                        info.iframe_srcs = [];
-                        for (let i = 0; i < Math.min(3, iframes.length); i++) {
-                            info.iframe_srcs.push(iframes[i].src.substring(0, 100));
-                        }
-
-                        // Check for Cloudflare cData in scripts
-                        let scripts = document.querySelectorAll('script');
-                        info.cloudflare_scripts = 0;
-                        for (let script of scripts) {
-                            if (script.src.includes('challenges.cloudflare.com') ||
-                                script.textContent.includes('cData') ||
-                                script.textContent.includes('cRay')) {
-                                info.cloudflare_scripts++;
-                            }
-                        }
-
-                        return info;
-                    }
-                """)
-                logger.warning(f"[SITEKEY] Page structure: {page_info}")
-            except Exception as e:
-                logger.debug(f"[SITEKEY] Could not dump structure: {e}")
     except Exception as e:
-        logger.debug(f"Error extracting sitekey: {e}")
+        logger.debug(f"[SITEKEY] JS extraction error: {e}")
 
+    logger.warning("[SITEKEY] Sitekey not found")
     return None
 
-def solve_cloudflare_api(page_url: str, sitekey: str, logger, proxy_str: str = None, captcha_params: dict = None) -> str:
-    """Отправить задачу в 2Captcha для решения Cloudflare Turnstile"""
+def solve_cloudflare_api(page_url: str, sitekey: str, logger,
+                         proxy_host: str = None, proxy_port: int = None,
+                         proxy_user: str = None, proxy_pass: str = None) -> str:
+    """Решить Cloudflare Turnstile через 2Captcha (TurnstileTask с прокси)"""
     if not CAPTCHA_API_KEY:
         logger.warning("CAPTCHA_API_KEY не установлен")
         return None
 
     try:
-        final_sitekey = sitekey if sitekey else "0x4AAAAAAAAjq6WYeRDKmebM"
-        logger.info(f"Отправка задачи в 2Captcha (TurnstileTaskProxyless, sitekey={final_sitekey[:20]}...)")
+        logger.info(f"[2captcha] Отправка задачи sitekey={sitekey[:20]}...")
 
-        # Шаг 1: Создать задачу TurnstileTaskProxyless в 2Captcha
-        task_data = {
-            "clientKey": CAPTCHA_API_KEY,
-            "task": {
-                "type": "TurnstileTaskProxyless",
-                "websiteURL": page_url,
-                "websiteKey": final_sitekey
-            }
+        task = {
+            "type": "TurnstileTask",
+            "websiteURL": page_url,
+            "websiteKey": sitekey,
         }
+        if proxy_host and proxy_port:
+            task["proxyType"] = "socks5"
+            task["proxyAddress"] = proxy_host
+            task["proxyPort"] = proxy_port
+            if proxy_user:
+                task["proxyLogin"] = proxy_user
+            if proxy_pass:
+                task["proxyPassword"] = proxy_pass
+        else:
+            task["type"] = "TurnstileTaskProxyless"
 
-        # Добавить дополнительные параметры для Cloudflare Challenge если есть
-        if captcha_params:
-            if captcha_params.get("action"):
-                task_data["task"]["action"] = captcha_params["action"]
-                logger.info(f"  Added action: {captcha_params['action']}")
-            if captcha_params.get("cData"):
-                task_data["task"]["data"] = captcha_params["cData"]
-                logger.info(f"  Added cData: {captcha_params['cData'][:40]}...")
-            if captcha_params.get("chlPageData"):
-                task_data["task"]["pagedata"] = captcha_params["chlPageData"]
-                logger.info(f"  Added chlPageData: {captcha_params['chlPageData'][:40]}...")
+        resp = requests.post(
+            "https://api.2captcha.com/createTask",
+            json={"clientKey": CAPTCHA_API_KEY, "task": task},
+            timeout=30,
+        ).json()
 
-        logger.debug(f"JSON для 2Captcha: {task_data}")
-        resp = requests.post("https://api.2captcha.com/createTask", json=task_data, timeout=30)
-
-        result = resp.json()
-        task_id = result.get("taskId")
-        error_id = result.get("errorId")
-
-        if error_id and error_id != 0:
-            error_desc = result.get("errorDescription") or str(result)
-            logger.warning(f"2Captcha ошибка (errorId={error_id}): {error_desc}")
+        if resp.get("errorId"):
+            logger.warning(f"[2captcha] Submit error: {resp.get('errorDescription')}")
             return None
 
+        task_id = resp.get("taskId")
         if not task_id:
-            logger.warning(f"2Captcha: нет taskId в ответе: {result}")
+            logger.warning(f"[2captcha] Нет taskId: {resp}")
             return None
 
-        logger.info(f"Задача создана: ID={task_id}")
+        logger.info(f"[2captcha] Task {task_id} — ожидание...")
 
-        # Шаг 2: Ждать результат (до 2 минут)
-        for attempt in range(24):
+        for attempt in range(36):
             time.sleep(5)
+            result = requests.post(
+                "https://api.2captcha.com/getTaskResult",
+                json={"clientKey": CAPTCHA_API_KEY, "taskId": task_id},
+                timeout=30,
+            ).json()
 
-            try:
-                result = requests.post("https://api.2captcha.com/getTaskResult", json={
-                    "clientKey": CAPTCHA_API_KEY,
-                    "taskId": task_id
-                }, timeout=30).json()
+            if result.get("errorId"):
+                logger.warning(f"[2captcha] Poll error: {result.get('errorDescription')}")
+                return None
 
-                if result.get("status") == "ready":
-                    solution = result.get("solution", {})
-                    # 2Captcha TurnstileTaskProxyless возвращает token
-                    token = solution.get("token")
-                    if token:
-                        logger.info(f"✓ Turnstile решена! Токен получен")
-                        return token
-                    else:
-                        logger.warning(f"2Captcha: нет токена в решении: {solution}")
-                        return None
+            if result.get("status") == "ready":
+                token = result.get("solution", {}).get("token")
+                if token:
+                    logger.info(f"[2captcha] Токен получен: {token[:40]}...")
+                    return token
+                logger.warning(f"[2captcha] Нет токена в ответе: {result}")
+                return None
 
-                if attempt % 5 == 0:
-                    logger.info(f"Ожидание результата... ({attempt*5}s)")
+            if attempt % 6 == 0:
+                logger.info(f"[2captcha] Ожидание... {attempt * 5}s")
 
-            except Exception as poll_error:
-                logger.debug(f"Ошибка при опросе результата (attempt {attempt}): {poll_error}")
-                if attempt > 20:
-                    break
-                continue
-
-        logger.warning("2Captcha: таймаут (2 минуты)")
+        logger.warning("[2captcha] Таймаут (3 минуты)")
         return None
 
     except Exception as e:
-        logger.error(f"Ошибка в solve_cloudflare_api: {e}")
+        logger.error(f"[2captcha] Ошибка: {e}")
         return None
 
 def inject_turnstile_token(page, token: str, logger) -> bool:
-    """Вставить токен Turnstile или cf_clearance cookie в контекст браузера"""
+    """Вставить Turnstile токен в страницу и отправить форму"""
     try:
-        # Проверим, это cookie или Turnstile токен
-        if len(token) > 100:  # cf_clearance cookies обычно длинные
-            logger.info("Вставляем cf_clearance cookie в контекст браузера...")
-            try:
-                # Получить domain из текущего URL
-                current_url = page.url
-                domain = ".secure.runescape.com" if "runescape.com" in current_url else "secure.runescape.com"
+        logger.info("[inject] Вставляем токен...")
+        result = page.evaluate(f"""
+            (() => {{
+                const token = {repr(token)};
 
-                # Вставить cookie в контекст браузера
-                page.context.add_cookies([{
-                    "name": "cf_clearance",
-                    "value": token,
-                    "domain": domain,
-                    "path": "/",
-                    "httpOnly": True,
-                    "secure": True,
-                    "sameSite": "None"
-                }])
-                logger.info("✓ cf_clearance cookie вставлен в контекст")
-                return True
-            except Exception as e:
-                logger.error(f"Error injecting cf_clearance cookie: {e}")
-                return False
-        else:
-            # Это Turnstile токен - старый метод
-            logger.info("Инжектируем Turnstile токен в страницу...")
-            page.evaluate(f"""
-                () => {{
-                    let input = document.querySelector('[name="cf-turnstile-response"]');
-                    if (input) {{
-                        input.value = '{token}';
-                    }}
-                    if (window.turnstile && window.turnstile.getResponse) {{
-                        window.turnstile.reset();
-                    }}
-                    if (window.tsCallback) {{
-                        window.tsCallback('{token}');
+                // Метод 1: hidden input с native setter (обходит React/Vue проверку)
+                const input = document.querySelector('input[name="cf-turnstile-response"]');
+                if (input) {{
+                    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')
+                        .set.call(input, token);
+                    input.dispatchEvent(new Event('input', {{bubbles: true}}));
+                    input.dispatchEvent(new Event('change', {{bubbles: true}}));
+                }}
+
+                // Метод 2: именованный callback на виджете
+                const widget = document.querySelector('[data-sitekey][data-callback]');
+                if (widget) {{
+                    const cb = widget.dataset.callback;
+                    if (typeof window[cb] === 'function') {{
+                        window[cb](token);
+                        return 'callback:' + cb;
                     }}
                 }}
-            """)
-            logger.info("✓ Turnstile токен инжектирован")
-            return True
 
+                // Метод 3: window.tsCallback / глобальный callback
+                if (typeof window.tsCallback === 'function') {{
+                    window.tsCallback(token);
+                    return 'tsCallback';
+                }}
+
+                // Метод 4: submit формы
+                const form = document.querySelector('form');
+                if (form) {{
+                    form.submit();
+                    return 'form_submitted';
+                }}
+
+                return input ? 'input_set' : 'no_action';
+            }})()
+        """)
+        logger.info(f"[inject] Результат: {result}")
+        return True
     except Exception as e:
-        logger.error(f"Error in inject_turnstile_token: {e}")
+        logger.error(f"[inject] Ошибка: {e}")
         return False
 
 def diagnose_page_structure(page, logger):
@@ -693,98 +631,85 @@ def try_click_by_coordinates(page, logger) -> bool:
         return False
 
 
-def handle_cloudflare_turnstile(page, logger, captured_sitekey_dict=None) -> bool:
-    """Enhanced Cloudflare Challenge handler with multiple click strategies"""
+def is_challenge_page(page) -> bool:
+    """Проверить, открыта ли страница Cloudflare Challenge"""
     try:
-        # DETECT: Check if CAPTCHA present
-        logger.info("[CAPTCHA] Checking for Cloudflare Challenge...")
-        try:
-            current_title = page.title()
-        except:
-            logger.info("[CAPTCHA] Page closed")
+        title = page.title()
+        if any(t in title for t in ("Just a moment", "Checking your Browser", "Are you a robot")):
+            return True
+    except Exception:
+        pass
+    try:
+        if page.locator("iframe[src*='challenges.cloudflare.com']").count() > 0:
+            return True
+        if any("challenges.cloudflare.com" in f.url for f in page.frames):
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def handle_cloudflare_turnstile(page, logger, account_data: dict = None) -> bool:
+    """Решить Cloudflare Turnstile через 2captcha (с fallback на ручное решение)"""
+    try:
+        logger.info("[CAPTCHA] Проверка Cloudflare Challenge...")
+        if not is_challenge_page(page):
+            logger.info("[CAPTCHA] Челлендж не обнаружен")
             return True
 
-        if "Just a moment" not in current_title:
-            logger.info("[CAPTCHA] No challenge - page loaded normally")
-            return True
-
-        logger.info("[CAPTCHA] Cloudflare Challenge detected")
-
-        # Diagnose page structure
+        logger.info("[CAPTCHA] Челлендж обнаружен — запускаем 2captcha...")
         diagnose_page_structure(page, logger)
 
-        # CRITICAL: Wait for Cloudflare Challenge UI to render (iframes/checkboxes to appear)
-        logger.info("[CAPTCHA] Waiting for challenge UI to render...")
+        # Ждём рендера UI
         try:
-            # Wait for either iframes or checkbox to appear
             page.wait_for_function(
-                "() => document.querySelectorAll('iframe').length > 0 || document.querySelector('input[type=\"checkbox\"]')",
+                "() => document.querySelectorAll('iframe').length > 0 || !!window._cf_chl_opt",
                 timeout=15000
             )
-            logger.info("[CAPTCHA] Challenge UI detected")
-        except:
-            logger.warning("[CAPTCHA] Challenge UI didn't render in time - trying anyway")
-
-        # Small delay to let UI fully render
+        except Exception:
+            logger.warning("[CAPTCHA] UI не отрендерился за 15s — продолжаем")
         time.sleep(2)
 
-        # Re-diagnose after waiting
-        logger.info("[CAPTCHA] Re-diagnosing page after UI render...")
-        diagnose_page_structure(page, logger)
+        sitekey = get_turnstile_sitekey(page, logger)
+        if not sitekey:
+            logger.warning("[CAPTCHA] Sitekey не найден — ждём ручного решения")
+            return wait_manual_captcha(page, logger)
 
-        # Try multiple strategies to click the checkbox
-        logger.info("[CAPTCHA] Strategy 1: Attempting iframe-based click...")
-        if try_click_turnstile_checkbox(page, logger):
+        # Прокси из account_data
+        proxy_host = proxy_port = proxy_user = proxy_pass = None
+        if account_data:
+            proxy_host = account_data.get("proxy_host")
+            proxy_port = account_data.get("proxy_port")
+            proxy_user = account_data.get("proxy_user")
+            proxy_pass = account_data.get("proxy_pass")
+
+        token = solve_cloudflare_api(
+            page.url, sitekey, logger,
+            proxy_host=proxy_host, proxy_port=proxy_port,
+            proxy_user=proxy_user, proxy_pass=proxy_pass,
+        )
+
+        if not token:
+            logger.warning("[CAPTCHA] 2captcha не вернул токен — ждём ручного решения")
+            return wait_manual_captcha(page, logger)
+
+        inject_turnstile_token(page, token, logger)
+
+        try:
+            page.wait_for_load_state("networkidle", timeout=15000)
+        except Exception:
+            pass
+        time.sleep(2)
+
+        if not is_challenge_page(page):
+            logger.info("[CAPTCHA] Челлендж пройден!")
             return True
 
-        logger.info("[CAPTCHA] Strategy 2: Attempting coordinate-based click...")
-        if try_click_by_coordinates(page, logger):
-            return True
-
-        # Fallback: Wait for Kameleo's fingerprinting to auto-pass
-        logger.info("[CAPTCHA] Strategy 3: Waiting for Kameleo fingerprinting to auto-pass...")
-        logger.info("[CAPTCHA] Kameleo will handle browser verification - waiting...")
-
-        # Extended wait for browser verification
-        time.sleep(20)
-
-        # WAIT: Wait for challenge to pass - BOTH conditions must be true
-        logger.info("[CAPTCHA] Monitoring for challenge bypass...")
-        start_time = time.time()
-        timeout = 120  # 120 seconds for auto-pass
-
-        while time.time() - start_time < timeout:
-            try:
-                current_title = page.title()
-                current_url = page.url
-
-                title_ok = "Just a moment" not in current_title
-                url_ok = "cf_chl_rt_tk" not in current_url
-
-                logger.debug(f"[CAPTCHA] Title OK: {title_ok}, URL OK: {url_ok}")
-
-                # Both conditions must be true
-                if title_ok and url_ok:
-                    logger.info(f"[CAPTCHA] Challenge auto-passed! Title: {current_title}")
-                    time.sleep(2)
-                    return True
-
-                # Still on challenge page
-                elapsed = int(time.time() - start_time)
-                if elapsed % 15 == 0:
-                    logger.info(f"[CAPTCHA] Still waiting... {elapsed}s")
-
-                time.sleep(2)
-            except Exception as e:
-                logger.debug(f"[CAPTCHA] Check error: {e}")
-                time.sleep(2)
-
-        logger.warning("[CAPTCHA] Challenge timeout - could not bypass")
-        logger.warning("[CAPTCHA] Please solve CAPTCHA manually if browser is still open")
-        return False
+        logger.warning("[CAPTCHA] Страница всё ещё на челлендже после инжекта — ждём ручного")
+        return wait_manual_captcha(page, logger)
 
     except Exception as e:
-        logger.error(f"[CAPTCHA] Error: {e}")
+        logger.error(f"[CAPTCHA] Ошибка: {e}")
         return False
 
 def wait_manual_captcha(page, logger) -> bool:
@@ -1035,7 +960,7 @@ def main(file_number=1):
                 logger.info("=" * 60)
                 logger.info("STEP 4: Handle CAPTCHA")
                 logger.info("=" * 60)
-                handle_cloudflare_turnstile(page, logger)
+                handle_cloudflare_turnstile(page, logger, account_data=account_data)
 
                 # ---- STEP 5: Fill recovery form ----
                 logger.info("")
