@@ -16,8 +16,9 @@ import requests
 SPEED_FACTOR = 1
 RESULTS_FOLDER = r"C:\Users\gogog\Downloads\Xivora\LZT\results"
 
-# CAPTCHA Config (optional)
-CAPTCHA_API_KEY = "852675d7f72a99e3047e8ba106177696"  # 2Captcha API key
+# CAPTCHA Config
+CAPTCHA_API_KEY  = "852675d7f72a99e3047e8ba106177696"  # 2Captcha API key
+CAPSOLVER_API_KEY = ""  # CapSolver key (capsolver.com) — нужен для managed challenge
 PROXY_STRING = "38.49.216.136:34181:DVS6xh9vgn:pVa387P"  # SOCKS5 proxy
 
 # ---- Logging setup ----
@@ -303,76 +304,172 @@ def _submit_2captcha_task(task: dict, logger) -> str | None:
     return None
 
 
+def _clean_cf_url(page_url: str) -> str:
+    """Убрать CF-challenge токены из URL перед отправкой в сервис решения."""
+    from urllib.parse import urlparse, urlencode, parse_qs, urlunparse
+    parsed = urlparse(page_url)
+    drop = {"__cf_chl_rt_tk", "__cf_chl_f_tk", "cf_chl_captcha_tk"}
+    qs = {k: v for k, v in parse_qs(parsed.query).items() if k not in drop}
+    return urlunparse(parsed._replace(query=urlencode(qs, doseq=True)))
+
+
+def _solve_via_capsolver(page_url: str, sitekey: str, logger,
+                         pagedata=None) -> str | None:
+    """Решить managed Cloudflare challenge через CapSolver."""
+    if not CAPSOLVER_API_KEY:
+        return None
+    try:
+        task = {
+            "type": "AntiTurnstileTaskProxyLess",
+            "websiteURL": page_url,
+            "websiteKey": sitekey,
+            "metadata": {"action": "managed"},
+        }
+        if pagedata:
+            task["metadata"]["chlPageData"] = pagedata
+
+        logger.info(f"[CapSolver] Отправка задачи sitekey={sitekey[:20]}...")
+        resp = requests.post(
+            "https://api.capsolver.com/createTask",
+            json={"clientKey": CAPSOLVER_API_KEY, "task": task},
+            timeout=30,
+        ).json()
+
+        if resp.get("errorId"):
+            logger.warning(f"[CapSolver] Ошибка: {resp.get('errorDescription')}")
+            return None
+
+        task_id = resp.get("taskId")
+        if not task_id:
+            logger.warning(f"[CapSolver] Нет taskId: {resp}")
+            return None
+
+        logger.info(f"[CapSolver] Task {task_id} — ожидание...")
+        for attempt in range(36):
+            time.sleep(5)
+            result = requests.post(
+                "https://api.capsolver.com/getTaskResult",
+                json={"clientKey": CAPSOLVER_API_KEY, "taskId": task_id},
+                timeout=30,
+            ).json()
+            if result.get("errorId"):
+                logger.warning(f"[CapSolver] Poll error: {result.get('errorDescription')}")
+                return None
+            if result.get("status") == "ready":
+                token = result.get("solution", {}).get("token")
+                if token:
+                    logger.info(f"[CapSolver] Токен получен: {token[:40]}...")
+                    return token
+                return None
+            if attempt % 6 == 0:
+                logger.info(f"[CapSolver] Ожидание... {attempt * 5}s")
+        logger.warning("[CapSolver] Таймаут")
+        return None
+    except Exception as e:
+        logger.error(f"[CapSolver] Ошибка: {e}")
+        return None
+
+
+def _solve_via_2captcha_form(page_url: str, sitekey: str, logger) -> str | None:
+    """Попытка через старый form-encoded API 2captcha (другой путь валидации)."""
+    try:
+        logger.info("[2captcha-form] Отправка через in.php...")
+        resp = requests.post(
+            "https://2captcha.com/in.php",
+            data={
+                "key": CAPTCHA_API_KEY,
+                "method": "turnstile",
+                "sitekey": sitekey,
+                "pageurl": page_url,
+                "json": "1",
+            },
+            timeout=30,
+        ).json()
+        logger.info(f"[2captcha-form] Ответ: {resp}")
+
+        if resp.get("status") != 1:
+            logger.warning(f"[2captcha-form] Ошибка: {resp.get('request')}")
+            return None
+
+        task_id = resp["request"]
+        logger.info(f"[2captcha-form] Task {task_id} — ожидание...")
+        for attempt in range(36):
+            time.sleep(5)
+            result = requests.get(
+                "https://2captcha.com/res.php",
+                params={"key": CAPTCHA_API_KEY, "action": "get", "id": task_id, "json": "1"},
+                timeout=30,
+            ).json()
+            if result.get("status") == 1:
+                token = result.get("request")
+                logger.info(f"[2captcha-form] Токен: {token[:40]}...")
+                return token
+            if result.get("request") == "CAPCHA_NOT_READY":
+                if attempt % 6 == 0:
+                    logger.info(f"[2captcha-form] Ожидание... {attempt * 5}s")
+                continue
+            logger.warning(f"[2captcha-form] Ошибка: {result}")
+            return None
+        logger.warning("[2captcha-form] Таймаут")
+        return None
+    except Exception as e:
+        logger.error(f"[2captcha-form] Ошибка: {e}")
+        return None
+
+
 def solve_cloudflare_api(page_url: str, sitekey: str, logger,
                          proxy_host: str = None, proxy_port: int = None,
                          proxy_user: str = None, proxy_pass: str = None,
                          pagedata: str = None) -> str:
-    """Решить Cloudflare Turnstile через 2Captcha.
+    """Решить Cloudflare Turnstile/Managed Challenge.
 
-    Для managed challenge (Just a moment) требуется pagedata из _cf_chl_opt.chlPageData.
-    Стратегия попыток:
-    1. TurnstileTask + http-прокси
-    2. TurnstileTask + socks5-прокси
-    3. TurnstileTaskProxyless
+    Порядок попыток:
+    1. CapSolver (AntiTurnstileTaskProxyLess) — лучший для managed challenge
+    2. 2captcha JSON API (TurnstileTask http → socks5 → ProxyLess)
+    3. 2captcha form API (in.php) — другой путь валидации
     """
-    if not CAPTCHA_API_KEY:
-        logger.warning("CAPTCHA_API_KEY не установлен")
-        return None
+    clean_url = _clean_cf_url(page_url)
+    logger.info(f"[captcha] URL: {clean_url}  sitekey: {sitekey[:20]}  pagedata: {'да' if pagedata else 'нет'}")
 
-    # Проверяем баланс — сразу видим если ключ невалиден
-    balance = check_2captcha_balance(logger)
-    if balance is None:
-        return None
-    if balance < 0.001:
-        logger.error(f"[2captcha] Баланс слишком низкий: ${balance}")
-        return None
+    # 1. CapSolver
+    if CAPSOLVER_API_KEY:
+        token = _solve_via_capsolver(clean_url, sitekey, logger, pagedata)
+        if token:
+            return token
+        logger.info("[captcha] CapSolver не сработал — пробуем 2captcha JSON...")
 
-    # Чистый URL без CF-challenge токенов
-    from urllib.parse import urlparse, urlencode, parse_qs, urlunparse
-    parsed = urlparse(page_url)
-    cf_params = {"__cf_chl_rt_tk", "__cf_chl_f_tk", "cf_chl_captcha_tk"}
-    qs = {k: v for k, v in parse_qs(parsed.query).items() if k not in cf_params}
-    clean_url = urlunparse(parsed._replace(query=urlencode(qs, doseq=True)))
-    logger.info(f"[2captcha] URL для решения: {clean_url}")
-    if pagedata:
-        logger.info(f"[2captcha] pagedata передан ({len(pagedata)} chars)")
-    else:
-        logger.warning("[2captcha] pagedata НЕ передан — managed challenge может не решиться")
+    # 2. 2captcha JSON API
+    if CAPTCHA_API_KEY:
+        balance = check_2captcha_balance(logger)
+        if balance and balance >= 0.001:
+            common = {"websiteURL": clean_url, "websiteKey": sitekey}
+            if pagedata:
+                common["pagedata"] = pagedata
 
-    base_task = {
-        "websiteURL": clean_url,
-        "websiteKey": sitekey,
-    }
-    if pagedata:
-        base_task["pagedata"] = pagedata
+            json_attempts = []
+            if proxy_host and proxy_port:
+                px = {"proxyAddress": proxy_host, "proxyPort": int(proxy_port)}
+                if proxy_user: px["proxyLogin"] = proxy_user
+                if proxy_pass: px["proxyPassword"] = proxy_pass
+                json_attempts.append({"type": "TurnstileTask", "proxyType": "http",   **common, **px})
+                json_attempts.append({"type": "TurnstileTask", "proxyType": "socks5", **common, **px})
+            json_attempts.append({"type": "TurnstileTaskProxyless", **common})
 
-    attempts = []
+            for task in json_attempts:
+                try:
+                    token = _submit_2captcha_task(task, logger)
+                    if token:
+                        return token
+                    logger.info(f"[2captcha] {task['type']} не сработал")
+                except Exception as e:
+                    logger.error(f"[2captcha] {task.get('type')}: {e}")
 
-    if proxy_host and proxy_port:
-        proxy_fields = {
-            "proxyAddress": proxy_host,
-            "proxyPort": int(proxy_port),
-        }
-        if proxy_user:
-            proxy_fields["proxyLogin"] = proxy_user
-        if proxy_pass:
-            proxy_fields["proxyPassword"] = proxy_pass
+        # 3. 2captcha form API
+        token = _solve_via_2captcha_form(clean_url, sitekey, logger)
+        if token:
+            return token
 
-        attempts.append({**base_task, "type": "TurnstileTask", "proxyType": "http",   **proxy_fields})
-        attempts.append({**base_task, "type": "TurnstileTask", "proxyType": "socks5", **proxy_fields})
-
-    attempts.append({**base_task, "type": "TurnstileTaskProxyless"})
-
-    for task in attempts:
-        try:
-            token = _submit_2captcha_task(task, logger)
-            if token:
-                return token
-            logger.info(f"[2captcha] Тип {task['type']} не сработал — пробуем следующий...")
-        except Exception as e:
-            logger.error(f"[2captcha] Ошибка при попытке {task.get('type')}: {e}")
-
-    logger.warning("[2captcha] Все попытки исчерпаны")
+    logger.warning("[captcha] Все сервисы исчерпаны")
     return None
 
 def inject_turnstile_token(page, token: str, logger) -> bool:
