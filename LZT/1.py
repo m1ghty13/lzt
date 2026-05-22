@@ -235,79 +235,99 @@ def get_turnstile_sitekey(page, logger) -> str:
     logger.warning("[SITEKEY] Sitekey not found")
     return None
 
+def _submit_2captcha_task(task: dict, logger) -> str | None:
+    """Submit task to 2captcha and poll until ready. Returns taskId or None."""
+    logger.info(f"[2captcha] Отправка: type={task.get('type')} sitekey={task.get('websiteKey', '')[:20]}...")
+    resp = requests.post(
+        "https://api.2captcha.com/createTask",
+        json={"clientKey": CAPTCHA_API_KEY, "task": task},
+        timeout=30,
+    ).json()
+
+    if resp.get("errorId"):
+        logger.warning(f"[2captcha] Submit error ({resp.get('errorId')}): {resp.get('errorDescription')}")
+        return None
+
+    task_id = resp.get("taskId")
+    if not task_id:
+        logger.warning(f"[2captcha] Нет taskId в ответе: {resp}")
+        return None
+
+    logger.info(f"[2captcha] Task {task_id} — ожидание решения...")
+    for attempt in range(36):
+        time.sleep(5)
+        result = requests.post(
+            "https://api.2captcha.com/getTaskResult",
+            json={"clientKey": CAPTCHA_API_KEY, "taskId": task_id},
+            timeout=30,
+        ).json()
+
+        if result.get("errorId"):
+            logger.warning(f"[2captcha] Poll error: {result.get('errorDescription')}")
+            return None
+
+        if result.get("status") == "ready":
+            token = result.get("solution", {}).get("token")
+            if token:
+                logger.info(f"[2captcha] Токен получен: {token[:40]}...")
+                return token
+            logger.warning(f"[2captcha] Нет токена в решении: {result}")
+            return None
+
+        if attempt % 6 == 0:
+            logger.info(f"[2captcha] Ожидание... {attempt * 5}s")
+
+    logger.warning("[2captcha] Таймаут (3 минуты)")
+    return None
+
+
 def solve_cloudflare_api(page_url: str, sitekey: str, logger,
                          proxy_host: str = None, proxy_port: int = None,
                          proxy_user: str = None, proxy_pass: str = None) -> str:
-    """Решить Cloudflare Turnstile через 2Captcha (TurnstileTask с прокси)"""
+    """Решить Cloudflare Turnstile через 2Captcha.
+
+    Стратегия:
+    1. TurnstileTask с http-прокси (если прокси переданы)
+    2. Fallback → TurnstileTask с socks5-прокси
+    3. Fallback → TurnstileTaskProxyless (без прокси)
+    """
     if not CAPTCHA_API_KEY:
         logger.warning("CAPTCHA_API_KEY не установлен")
         return None
 
-    try:
-        logger.info(f"[2captcha] Отправка задачи sitekey={sitekey[:20]}...")
+    base_task = {
+        "websiteURL": page_url,
+        "websiteKey": sitekey,
+    }
 
-        task = {
-            "type": "TurnstileTask",
-            "websiteURL": page_url,
-            "websiteKey": sitekey,
+    attempts = []
+
+    if proxy_host and proxy_port:
+        proxy_fields = {
+            "proxyAddress": proxy_host,
+            "proxyPort": int(proxy_port),
         }
-        if proxy_host and proxy_port:
-            task["proxyType"] = "socks5"
-            task["proxyAddress"] = proxy_host
-            task["proxyPort"] = proxy_port
-            if proxy_user:
-                task["proxyLogin"] = proxy_user
-            if proxy_pass:
-                task["proxyPassword"] = proxy_pass
-        else:
-            task["type"] = "TurnstileTaskProxyless"
+        if proxy_user:
+            proxy_fields["proxyLogin"] = proxy_user
+        if proxy_pass:
+            proxy_fields["proxyPassword"] = proxy_pass
 
-        resp = requests.post(
-            "https://api.2captcha.com/createTask",
-            json={"clientKey": CAPTCHA_API_KEY, "task": task},
-            timeout=30,
-        ).json()
+        attempts.append({**base_task, "type": "TurnstileTask", "proxyType": "http",   **proxy_fields})
+        attempts.append({**base_task, "type": "TurnstileTask", "proxyType": "socks5", **proxy_fields})
 
-        if resp.get("errorId"):
-            logger.warning(f"[2captcha] Submit error: {resp.get('errorDescription')}")
-            return None
+    attempts.append({**base_task, "type": "TurnstileTaskProxyless"})
 
-        task_id = resp.get("taskId")
-        if not task_id:
-            logger.warning(f"[2captcha] Нет taskId: {resp}")
-            return None
+    for task in attempts:
+        try:
+            token = _submit_2captcha_task(task, logger)
+            if token:
+                return token
+            logger.info(f"[2captcha] Тип {task['type']} не сработал — пробуем следующий...")
+        except Exception as e:
+            logger.error(f"[2captcha] Ошибка при попытке {task.get('type')}: {e}")
 
-        logger.info(f"[2captcha] Task {task_id} — ожидание...")
-
-        for attempt in range(36):
-            time.sleep(5)
-            result = requests.post(
-                "https://api.2captcha.com/getTaskResult",
-                json={"clientKey": CAPTCHA_API_KEY, "taskId": task_id},
-                timeout=30,
-            ).json()
-
-            if result.get("errorId"):
-                logger.warning(f"[2captcha] Poll error: {result.get('errorDescription')}")
-                return None
-
-            if result.get("status") == "ready":
-                token = result.get("solution", {}).get("token")
-                if token:
-                    logger.info(f"[2captcha] Токен получен: {token[:40]}...")
-                    return token
-                logger.warning(f"[2captcha] Нет токена в ответе: {result}")
-                return None
-
-            if attempt % 6 == 0:
-                logger.info(f"[2captcha] Ожидание... {attempt * 5}s")
-
-        logger.warning("[2captcha] Таймаут (3 минуты)")
-        return None
-
-    except Exception as e:
-        logger.error(f"[2captcha] Ошибка: {e}")
-        return None
+    logger.warning("[2captcha] Все попытки исчерпаны")
+    return None
 
 def inject_turnstile_token(page, token: str, logger) -> bool:
     """Вставить Turnstile токен в страницу и отправить форму"""
