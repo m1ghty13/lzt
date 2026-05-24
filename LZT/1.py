@@ -392,7 +392,7 @@ def get_page_state(page, logger) -> str:
         return "captcha"
     if "email-confirmation" in url or "appealformresult" in url:
         return "confirmation"
-    if "message.ws" in url or "account-identified" in url:
+    if "message.ws" in url:
         return "rejected"
 
     try:
