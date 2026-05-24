@@ -547,6 +547,9 @@ def get_page_state(page, logger) -> str:
     if "email-confirmation" in url or "appealformresult" in url:
         return "confirmation"
 
+    if "message.ws" in url or "account-identified" in url:
+        return "rejected"
+
     try:
         if page.query_selector("#reg_email"):
             return "recovery_form"
@@ -770,6 +773,11 @@ def main(file_number=1):
                             logger.info(f"[DONE] Авто-закрытие через {AUTO_CLOSE_DELAY}s...")
                             time.sleep(AUTO_CLOSE_DELAY)
                             break
+
+                    elif state == "rejected":
+                        logger.warning(f"[REJECTED] Runescape отклонил запрос: {page.url}")
+                        logger.warning("[REJECTED] Возможные причины: аккаунт не найден, слишком много попыток, аккаунт заблокирован")
+                        break
 
                     elif state == "unknown":
                         # Форма могла загрузиться через JS без смены URL.
