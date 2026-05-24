@@ -28,6 +28,7 @@ import sys
 from pathlib import Path
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.request import HTTPXRequest
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -517,12 +518,14 @@ def main():
 
     RESULTS_FOLDER.mkdir(exist_ok=True)
 
-    app = (
-        Application.builder()
-        .token(BOT_TOKEN)
-        .post_init(_post_init)
-        .build()
-    )
+    builder = Application.builder().token(BOT_TOKEN).post_init(_post_init)
+
+    proxy_url = os.getenv("BOT_PROXY", "")
+    if proxy_url:
+        print(f"Using proxy: {proxy_url}")
+        builder = builder.request(HTTPXRequest(proxy=proxy_url))  # type: ignore[arg-type]
+
+    app = builder.build()
 
     app.add_handler(CommandHandler("start",  cmd_start))
     app.add_handler(CommandHandler("status", cmd_status))
