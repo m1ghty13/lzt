@@ -14,6 +14,12 @@ import logging
 SPEED_FACTOR = 1
 RESULTS_FOLDER = r"C:\Users\gogog\Downloads\Xivora\LZT\results"
 
+# ---- Failsafe / auto-close timings ----
+# If recovery_form is not reached within this many seconds → proxy too slow / bad trust score → auto-close
+FORM_REACH_TIMEOUT = 240   # 4 minutes
+# Seconds to wait after ticket is submitted before auto-closing the browser
+AUTO_CLOSE_DELAY = 10
+
 
 # ---- Logging setup ----
 def setup_logging(file_number: int):
@@ -699,8 +705,19 @@ def main(file_number=1):
                 form_submits = 0    # how many times recovery form was submitted
                 contact_clicked = False
                 state_hits = {}     # loop-detection counter per state
+                session_start = time.time()
+                form_reached = False   # tracks whether recovery_form was ever seen
 
                 for step in range(30):
+                    # Failsafe: if recovery form not reached within timeout → bad proxy / low trust score
+                    if not form_reached and (time.time() - session_start) > FORM_REACH_TIMEOUT:
+                        logger.warning(
+                            f"[FAILSAFE] Recovery form not reached within {FORM_REACH_TIMEOUT}s "
+                            f"(current state: {get_page_state(page, logger)}) — "
+                            f"proxy too slow or low trust score. Auto-closing."
+                        )
+                        break
+
                     state = get_page_state(page, logger)
                     state_hits[state] = state_hits.get(state, 0) + 1
                     logger.info(f"[Step {step + 1}] state={state}  url={page.url}")
@@ -729,8 +746,11 @@ def main(file_number=1):
                         wait_for_page(page, logger)
 
                     elif state == "recovery_form":
+                        form_reached = True
                         if form_submits >= 2:
                             logger.info("Форма заполнена дважды — завершение")
+                            logger.info(f"[DONE] Авто-закрытие через {AUTO_CLOSE_DELAY}s...")
+                            time.sleep(AUTO_CLOSE_DELAY)
                             break
                         fill_and_submit_recovery_form(page, account_data, dates, logger)
                         form_submits += 1
@@ -739,12 +759,16 @@ def main(file_number=1):
                     elif state == "confirmation":
                         if contact_clicked:
                             logger.info("Recovery завершён!")
+                            logger.info(f"[DONE] Авто-закрытие через {AUTO_CLOSE_DELAY}s...")
+                            time.sleep(AUTO_CLOSE_DELAY)
                             break
                         if click_contact_button(page, logger):
                             contact_clicked = True
                             wait_for_page(page, logger)
                         else:
-                            logger.info("Contact button не найдена — recovery завершён!")
+                            logger.info("Contact button не найдена — тикет отправлен!")
+                            logger.info(f"[DONE] Авто-закрытие через {AUTO_CLOSE_DELAY}s...")
+                            time.sleep(AUTO_CLOSE_DELAY)
                             break
 
                     elif state == "unknown":
