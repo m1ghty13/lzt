@@ -11,7 +11,9 @@ Commands:
   /status        — runner state + queued files
   /run           — start runner in watch mode (auto-enables live logs)
   /stop          — stop runner
-  /files         — list all account files
+  /files         — list all account files (queue)
+  /archive       — list archived (processed) files
+  /retry N       — move archived file #N back to queue for reprocessing
   /logs [N]      — last log lines for file N (default: most recent)
   /follow        — toggle live log streaming to this chat
   /proxy N ip:port:user:pass  — update proxy for file #N
@@ -40,6 +42,7 @@ BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "YOUR_TOKEN_HERE")
 OWNER_ID  = int(os.getenv("TG_OWNER_ID", "0"))
 
 RESULTS_FOLDER = Path(__file__).parent / "results"
+ARCHIVE_FOLDER = RESULTS_FOLDER / "archive"
 RUNNER_SCRIPT  = Path(__file__).parent / "run.py"
 PID_FILE       = Path(__file__).parent / ".runner.pid"
 
@@ -132,6 +135,20 @@ def _validate(text: str) -> tuple[bool, str]:
     if not account:
         return False, "No account data before proxy line"
     return True, ""
+
+
+def _archived_entries() -> list[tuple[int, str, Path]]:
+    """Return list of (original_num, timestamp, path) sorted newest-first."""
+    if not ARCHIVE_FOLDER.exists():
+        return []
+    entries = []
+    for f in ARCHIVE_FOLDER.iterdir():
+        if f.suffix != ".txt" or f.stem.startswith("log_"):
+            continue
+        parts = f.stem.split("_", 1)
+        if len(parts) == 2 and parts[0].isdigit():
+            entries.append((int(parts[0]), parts[1], f))
+    return sorted(entries, key=lambda x: x[1], reverse=True)
 
 
 def _last_log(num: int, n: int = 40) -> str:
@@ -231,13 +248,15 @@ def _status_text_and_kb():
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_html(
         "<b>Recovery Bot</b>\n\n"
-        "/status — runner state + files\n"
-        "/run    — start runner (watch mode)\n"
-        "/stop   — stop runner\n"
-        "/files  — list account files\n"
-        "/logs   — recent logs  (<code>/logs 2</code> for file #2)\n"
-        "/follow — toggle live log streaming\n"
-        "/proxy  — update proxy  (<code>/proxy 1 ip:port:user:pass</code>)\n\n"
+        "/status  — runner state + files\n"
+        "/run     — start runner (watch mode)\n"
+        "/stop    — stop runner\n"
+        "/files   — list queued account files\n"
+        "/archive — list processed (archived) files\n"
+        "/retry N — requeue file #N from archive\n"
+        "/logs    — recent logs  (<code>/logs 2</code> for file #2)\n"
+        "/follow  — toggle live log streaming\n"
+        "/proxy   — update proxy  (<code>/proxy 1 ip:port:user:pass</code>)\n\n"
         "Send a <code>.txt</code> account file to add it to the queue."
     )
 
@@ -340,6 +359,63 @@ async def cmd_proxy(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"✅ Proxy updated for file <b>#{num}</b>\n"
         f"<s>{old_proxy}</s>\n"
         f"<code>{proxy}</code>"
+    )
+
+
+@auth
+async def cmd_archive(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
+    entries = _archived_entries()
+    if not entries:
+        await update.message.reply_text("Archive is empty.")
+        return
+    lines = []
+    for num, ts, path in entries[:30]:  # cap at 30
+        try:
+            username = path.read_text(encoding="utf-8").splitlines()[0]
+        except Exception:
+            username = "?"
+        # ts format: 20260524_050538 → 05:05:38
+        pretty = f"{ts[9:11]}:{ts[11:13]}:{ts[13:15]}" if len(ts) >= 15 else ts
+        lines.append(f"📦 <b>#{num}</b> <code>{pretty}</code> — <code>{username}</code>")
+    header = f"<b>Archive ({len(entries)} files)</b>\n"
+    await update.message.reply_html(header + "\n".join(lines))
+
+
+@auth
+async def cmd_retry(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not ctx.args:
+        await update.message.reply_html(
+            "Usage: <code>/retry &lt;file#&gt;</code>\n"
+            "Moves the most recent archived version of that file back to the queue.\n"
+            "See /archive for available files."
+        )
+        return
+    try:
+        num = int(ctx.args[0])
+    except ValueError:
+        await update.message.reply_text("Invalid file number.")
+        return
+
+    # Find the most recent archive entry for this num
+    entries = [e for e in _archived_entries() if e[0] == num]
+    if not entries:
+        await update.message.reply_text(f"No archived file #{num} found.")
+        return
+
+    src = entries[0][2]  # most recent (sorted newest-first)
+    dst = RESULTS_FOLDER / f"{_next_num()}.txt"
+
+    import shutil
+    try:
+        shutil.copy2(str(src), str(dst))
+    except Exception as e:
+        await update.message.reply_text(f"❌ Copy failed: {e}")
+        return
+
+    username = next((l for l in dst.read_text(encoding="utf-8").splitlines() if l.strip()), "?")
+    note = "Runner will pick it up automatically." if _is_alive() else "Use /run to start the runner."
+    await update.message.reply_html(
+        f"♻️ File #{num} copied from archive → <b>#{dst.stem}</b> (<code>{username}</code>)\n{note}"
     )
 
 
@@ -452,10 +528,12 @@ def main():
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("run",    cmd_run))
     app.add_handler(CommandHandler("stop",   cmd_stop))
-    app.add_handler(CommandHandler("follow", cmd_follow))
-    app.add_handler(CommandHandler("proxy",  cmd_proxy))
-    app.add_handler(CommandHandler("files",  cmd_files))
-    app.add_handler(CommandHandler("logs",   cmd_logs))
+    app.add_handler(CommandHandler("follow",  cmd_follow))
+    app.add_handler(CommandHandler("proxy",   cmd_proxy))
+    app.add_handler(CommandHandler("files",   cmd_files))
+    app.add_handler(CommandHandler("archive", cmd_archive))
+    app.add_handler(CommandHandler("retry",   cmd_retry))
+    app.add_handler(CommandHandler("logs",    cmd_logs))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(CallbackQueryHandler(handle_callback))
 

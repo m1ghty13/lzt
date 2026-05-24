@@ -8,54 +8,93 @@ Usage:
     python run.py 1 3 5        # process files 1, 3, 5 in that order
     python run.py 2-6          # process files 2 through 6
 
-Watch mode:
-    Keeps running after all files are done.
-    As soon as a new N.txt appears in results/, it gets processed automatically.
-    Stop with Ctrl+C.
+After each file is processed it is moved to results/archive/ automatically.
+On restart only unprocessed files (still in results/) are picked up.
 """
 
 import sys
 import os
 import time
+import logging
+import shutil
 import importlib.util
+from pathlib import Path
 
-RESULTS_FOLDER = os.path.join(os.path.dirname(__file__), "results")
+RESULTS_FOLDER  = Path(__file__).parent / "results"
+ARCHIVE_FOLDER  = RESULTS_FOLDER / "archive"
 DELAY_BETWEEN_RUNS = 5   # seconds between accounts so Kameleo fully releases resources
 WATCH_POLL_INTERVAL = 5  # seconds between folder checks in watch mode
 
 
 def _load_main():
-    path = os.path.join(os.path.dirname(__file__), "1.py")
-    spec = importlib.util.spec_from_file_location("recovery_script", path)
-    mod = importlib.util.module_from_spec(spec)
+    path = Path(__file__).parent / "1.py"
+    spec = importlib.util.spec_from_file_location("recovery_script", str(path))
+    mod  = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod.main
 
 
-def _available_files():
-    numbers = []
-    for name in os.listdir(RESULTS_FOLDER):
-        stem, ext = os.path.splitext(name)
-        if ext == ".txt" and stem.isdigit():
-            numbers.append(int(stem))
-    return sorted(numbers)
+def _available_files() -> list[int]:
+    nums = []
+    for f in RESULTS_FOLDER.iterdir():
+        if f.suffix == ".txt" and f.stem.isdigit():
+            nums.append(int(f.stem))
+    return sorted(nums)
+
+
+def _close_log_handlers():
+    """Close all open logging file handlers (required before renaming on Windows)."""
+    root = logging.getLogger()
+    for h in root.handlers[:]:
+        try:
+            h.flush()
+            h.close()
+        except Exception:
+            pass
+    root.handlers.clear()
+    # Also clear named loggers
+    for name in list(logging.Logger.manager.loggerDict):
+        lgr = logging.getLogger(name)
+        for h in lgr.handlers[:]:
+            try:
+                h.flush()
+                h.close()
+            except Exception:
+                pass
+        lgr.handlers.clear()
+
+
+def _archive_file(num: int):
+    """Move processed account file + log to archive/ with a timestamp suffix."""
+    ARCHIVE_FOLDER.mkdir(exist_ok=True)
+    _close_log_handlers()   # must happen before moving log file on Windows
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    for src_name, dst_name in [
+        (f"{num}.txt",     f"{num}_{ts}.txt"),
+        (f"log_{num}.txt", f"log_{num}_{ts}.txt"),
+    ]:
+        src = RESULTS_FOLDER / src_name
+        if src.exists():
+            try:
+                shutil.move(str(src), str(ARCHIVE_FOLDER / dst_name))
+            except Exception as e:
+                print(f"  ⚠ Could not archive {src_name}: {e}")
+    print(f"  📦 File #{num} archived")
 
 
 def _parse_args(argv):
     watch = "--watch" in argv
-    argv = [a for a in argv if a != "--watch"]
+    argv  = [a for a in argv if a != "--watch"]
 
     if not argv:
         return _available_files(), watch
 
-    # "2-6" range syntax
     if len(argv) == 1 and "-" in argv[0]:
         a, b = argv[0].split("-", 1)
         a, b = int(a), int(b)
         available = set(_available_files())
         return [n for n in range(a, b + 1) if n in available], watch
 
-    # explicit list: "1 3 5"
     return sorted(int(x) for x in argv), watch
 
 
@@ -78,18 +117,20 @@ def _run_one(recovery_main, num, label, results):
         elapsed = time.time() - t0
         results[num] = ("ERROR", elapsed, str(e))
         print(f"\n  {label}  File #{num} — ERROR  ({_fmt(elapsed)}): {e}")
+    finally:
+        _archive_file(num)
 
 
 def _print_summary(results, batch_start):
     total_elapsed = time.time() - batch_start
     ok_count = sum(1 for r in results.values() if r[0] == "OK")
-    total = len(results)
+    total    = len(results)
     print(f"\n{'=' * 60}")
     print(f"  SUMMARY  |  {ok_count}/{total} OK  |  total {_fmt(total_elapsed)}")
     print(f"{'=' * 60}")
     for num in sorted(results):
         status, elapsed, err = results[num]
-        tag = "OK   " if status == "OK" else "ERROR"
+        tag  = "OK   " if status == "OK" else "ERROR"
         line = f"  File #{num:>3}  [{tag}]  {_fmt(elapsed)}"
         if err:
             line += f"  — {err}"
@@ -101,9 +142,9 @@ def main():
     file_numbers, watch = _parse_args(sys.argv[1:])
 
     recovery_main = _load_main()
-    results = {}
-    batch_start = time.time()
-    processed = set()
+    results       = {}
+    batch_start   = time.time()
+    processed     = set()
 
     # ── Initial batch ────────────────────────────────────────────
     if file_numbers:
@@ -116,7 +157,7 @@ def main():
         for idx, num in enumerate(file_numbers, 1):
             _run_one(recovery_main, num, f"[{idx}/{total}]", results)
             processed.add(num)
-            if idx < total:
+            if idx < total and _available_files():
                 print(f"  Waiting {DELAY_BETWEEN_RUNS}s before next account...")
                 time.sleep(DELAY_BETWEEN_RUNS)
     else:
@@ -139,7 +180,7 @@ def main():
     try:
         while True:
             available = set(_available_files())
-            pending = sorted(available - processed)
+            pending   = sorted(available - processed)
 
             if pending:
                 for num in pending:
@@ -150,7 +191,6 @@ def main():
                 print(f"\n  Watching for more files...  (Ctrl+C to stop)")
                 dots = 0
             else:
-                # Print a dot every 30s so user knows it's alive
                 time.sleep(WATCH_POLL_INTERVAL)
                 dots += WATCH_POLL_INTERVAL
                 if dots >= 30:
