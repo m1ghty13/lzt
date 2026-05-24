@@ -544,7 +544,7 @@ def get_page_state(page, logger) -> str:
     if is_challenge_page(page):
         return "captcha"
 
-    if "email-confirmation" in url:
+    if "email-confirmation" in url or "appealformresult" in url:
         return "confirmation"
 
     try:
@@ -812,13 +812,17 @@ def main(file_number=1):
     finally:
         try:
             if profile and client:
-                logger.info("Cleaning up Kameleo profile...")
+                logger.info("Stopping Kameleo browser...")
                 try:
-                    if hasattr(client.profile, "delete_profile"):
-                        client.profile.delete_profile(profile.id)
-                    logger.info("Profile cleaned up")
+                    client.profile.stop_profile(profile.id)
+                    logger.info("Browser stopped")
+                except Exception as e:
+                    logger.debug(f"stop_profile: {e}")
+                try:
+                    client.profile.delete_profile(profile.id)
+                    logger.info("Profile deleted")
                 except Exception:
-                    logger.info("Profile cleanup skipped")
+                    pass
         except Exception:
             pass
 
